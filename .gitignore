@@ -1,0 +1,21 @@
+# Outputs of this tool — kept on workstation, never committed
+*.tif
+*.tiff
+*.ats
+# preview PNGs and JSONs that the script writes for converted recordings;
+# tracked-by-name to avoid catching unrelated docs
+Rec-*.png
+Rec-*.json
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.ipynb_checkpoints/
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
