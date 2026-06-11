@@ -1,4 +1,4 @@
-"""Batch lossless conversion of FLIR ATS-US recordings to 16-bit BigTIFF.
+r"""Batch lossless conversion of FLIR ATS-US recordings to 16-bit BigTIFF.
 
 Each input ``Rec-NNNNNN.ats`` produces three files in the output folder:
 
