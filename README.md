@@ -132,16 +132,28 @@ Emissivities: [0.3, 0.9, 0.1]
 Proceed? [y/N/edit]:
 ```
 
-The script then writes one full conversion (TIFF + JSON + PNG) per
-emissivity value, with the value embedded in the filename:
+Test mode is deliberately frugal:
+
+1. It does ONE fast pass over the recording (`Unit.COUNTS`, uint16)
+   to find the frame with the highest mean ADC count -- that's the
+   hottest frame.
+2. For every emissivity value you asked for, only that single frame is
+   re-decoded with the override applied.
+3. All the results are packed into a single small multi-page float32
+   TIFF where each page is one emissivity result.  A 28-row label
+   strip is burnt in at the bottom of every page showing
+   `emissivity = X.XXX` in white text on a dark band.  In Fiji you
+   scroll-wheel through the stack, the label tells you which page
+   you're looking at, and `Image → Adjust → Brightness/Contrast → Auto`
+   makes the strip a tidy black bar at the bottom of the image.
 
 ```
-Rec-000548_eps0.300_temp_C.tif
-Rec-000548_eps0.300_meta.json
-Rec-000548_eps0.300_preview.png
-Rec-000548_eps0.400_temp_C.tif
-...
+Rec-000548_eps_sweep_temp_C.tif    one file, one page per emissivity
+Rec-000548_eps_sweep_meta.json     hottest frame index + per-page stats
 ```
+
+Typical sweep takes a few seconds and produces a TIFF in the single-
+digit-MB range even for ten emissivity values.
 
 After the sweep finishes you're asked whether to run another sweep
 (pick another file and / or other emissivity values), hand off to

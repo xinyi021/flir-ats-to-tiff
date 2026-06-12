@@ -61,13 +61,18 @@ Usage:
 
 Modes:
     On start the script asks whether you want TEST mode or BATCH mode.
-    Test mode is for parameter-sensitivity studies: pick one .ats, then
-    type the emissivity values to try (either a range '[start, end,
-    step]' or a discrete list '0.3 0.5 0.7') and the script writes one
-    full conversion per emissivity value, with the value embedded in the
-    output filename (e.g. Rec-000548_eps0.300_temp_C.tif).  After each
-    sweep you can run another, hand off to batch mode, or quit.  Batch
-    mode is the original whole-folder converter; it never loops back.
+    Test mode is for parameter-sensitivity studies: pick ONE .ats file,
+    then type the emissivity values to try (either a range '[start, end,
+    step]' or a discrete list '0.3 0.5 0.7').  The script then locates
+    the hottest frame in that .ats (one fast pass over the recording),
+    re-decodes ONLY that frame for every emissivity value, and writes a
+    single multi-page float32 TIFF where each page is one emissivity
+    result.  Each page has a "emissivity = X.XXX" label burnt as white
+    text on a dark strip into the bottom edge so you can scroll-wheel
+    through the pages in Fiji and read the value at a glance while
+    comparing pixel temperatures.  After each sweep you can run another,
+    hand off to batch mode, or quit.  Batch mode is the original
+    whole-folder converter; it never loops back.
 
 File-selection prompt (default behaviour):
     After finding the .ats files under --input the script prints a
@@ -120,7 +125,7 @@ except ImportError as exc:
 try:
     import numpy as np
     import tifffile
-    from PIL import Image
+    from PIL import Image, ImageDraw, ImageFont
 except ImportError as exc:
     print(
         f"ERROR: missing scientific package ({exc.name}).\n"
@@ -586,6 +591,179 @@ def prompt_emissivity_values() -> list[float]:
         print("  cancelled, re-entering")
 
 
+# ---------- Test-mode helpers (single-frame multi-emissivity stack) -------
+def _find_font(size: int):
+    """Best-effort TrueType font; fall back to PIL's tiny bitmap."""
+    for cand in ("arial.ttf",
+                 r"C:\Windows\Fonts\arial.ttf",
+                 r"C:\Windows\Fonts\segoeui.ttf"):
+        try:
+            return ImageFont.truetype(cand, size)
+        except (OSError, IOError):
+            continue
+    return ImageFont.load_default()
+
+
+def render_label_strip(text: str, width: int, height: int,
+                       bg_value: float, fg_value: float) -> np.ndarray:
+    """Return a (height, width) float32 strip with `text` rendered as
+    `fg_value` pixels on a `bg_value` background, centred."""
+    img = Image.new("L", (width, height), 0)
+    draw = ImageDraw.Draw(img)
+    font = _find_font(max(10, int(height * 0.65)))
+    bbox = draw.textbbox((0, 0), text, font=font)
+    tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
+    x = (width  - tw) // 2 - bbox[0]
+    y = (height - th) // 2 - bbox[1]
+    draw.text((x, y), text, fill=255, font=font)
+    mask = np.asarray(img, dtype=np.uint8)
+    strip = np.full((height, width), bg_value, dtype=np.float32)
+    strip[mask > 128] = fg_value
+    return strip
+
+
+def find_hottest_frame(ats_path: Path) -> tuple[int, float]:
+    """Scan the file in Unit.COUNTS (fast uint16 reads) and return
+    (frame_index, mean_count) of the page with the highest mean ADC
+    count.  Because the count -> temperature mapping is monotonic per
+    pixel, the hottest mean-count frame is also the hottest mean-
+    temperature frame."""
+    f = fnv.file.ImagerFile(str(ats_path))
+    f.unit = fnv.Unit.COUNTS
+    n = int(f.num_frames)
+    H, W = int(f.height), int(f.width)
+    best_idx, best_mean = -1, -1.0
+    report_step = max(1, n // 5)
+    for i in range(n):
+        f.get_frame(i)
+        m = float(np.asarray(f.final, dtype=np.uint16).reshape((H, W)).mean())
+        if m > best_mean:
+            best_mean = m
+            best_idx = i
+        if (i + 1) % report_step == 0 or (i + 1) == n:
+            print(f"    scan {i+1}/{n}", flush=True)
+    return best_idx, best_mean
+
+
+def test_sweep_one_file(ats_path: Path, out_dir: Path,
+                        emissivities: list[float], *,
+                        unit: str = "celsius",
+                        overwrite: bool = False) -> dict:
+    """For ONE .ats file:
+      1.  Find the hottest frame (mean ADC count) -- one pass over the stack.
+      2.  For each test emissivity, re-decode just that frame in
+          Unit.TEMPERATURE_FACTORY with object_parameters.emissivity
+          overridden, and append it (plus a label strip showing
+          "emissivity = X.XXX" in white at the bottom edge) as one page
+          of a single multi-page float32 TIFF.
+
+    Output (next to each other):
+        <stem>_eps_sweep_temp_{C|K}.tif      one page per emissivity
+        <stem>_eps_sweep_meta.json           hottest frame + per-page stats
+    """
+    out_dir.mkdir(parents=True, exist_ok=True)
+    stem = ats_path.stem
+    suff = "C" if unit == "celsius" else "K"
+    out_tif  = out_dir / f"{stem}_eps_sweep_temp_{suff}.tif"
+    out_json = out_dir / f"{stem}_eps_sweep_meta.json"
+    if not overwrite and out_tif.exists() and out_json.exists():
+        return {"status": "skipped",
+                "tif_mb": out_tif.stat().st_size / 1e6}
+
+    t0 = time.time()
+
+    print(f"  scanning for hottest frame in {ats_path.name} ...", flush=True)
+    best_idx, best_mean_count = find_hottest_frame(ats_path)
+    print(f"  hottest frame index = {best_idx}  "
+          f"(mean ADC = {best_mean_count:.1f})", flush=True)
+
+    pages, page_stats = [], []
+    H = W = None
+    unit_sym = "deg C" if unit == "celsius" else "K"
+    print(f"  rendering {len(emissivities)} emissivity page(s) ...", flush=True)
+    for j, eps in enumerate(emissivities, 1):
+        f = fnv.file.ImagerFile(str(ats_path))
+        apply_overrides(f, {"emissivity": float(eps)})
+        f.unit = fnv.Unit.TEMPERATURE_FACTORY
+        f.get_frame(best_idx)
+        if H is None:
+            H, W = int(f.height), int(f.width)
+        kelvin = np.asarray(f.final, dtype=np.float32).reshape((H, W))
+        page = kelvin - (KELVIN_OFFSET if unit == "celsius" else 0.0)
+        pages.append(page)
+        page_stats.append({
+            "page_index": j - 1,
+            "emissivity": float(eps),
+            "min": float(page.min()),
+            "max": float(page.max()),
+            "mean": float(page.mean()),
+        })
+        print(f"    [{j}/{len(emissivities)}] eps={eps:.3f}  "
+              f"min/mean/max = "
+              f"{page.min():.1f} / {page.mean():.1f} / {page.max():.1f} "
+              f"{unit_sym}", flush=True)
+
+    # Pick values that make the label strip a clear dark bar with bright
+    # white text under whatever auto-contrast Fiji applies to the stack.
+    gmin = float(min(p.min() for p in pages))
+    gmax = float(max(p.max() for p in pages))
+    span = max(gmax - gmin, 1.0)
+    bg_val = gmin - 0.05 * span - 1.0
+    fg_val = gmax + 0.05 * span + 1.0
+    strip_h = 28
+
+    print(f"  writing {out_tif.name}  "
+          f"({len(pages)} pages, {H+strip_h}x{W} float32) ...", flush=True)
+    with tifffile.TiffWriter(str(out_tif), bigtiff=False) as tw:
+        for page, eps in zip(pages, emissivities):
+            label = f"emissivity = {eps:.3f}"
+            strip = render_label_strip(label, W, strip_h, bg_val, fg_val)
+            page_with_label = np.concatenate([page, strip], axis=0)
+            tw.write(
+                page_with_label, photometric="minisblack",
+                compression="zlib", compressionargs={"level": ZLIB_LEVEL},
+                contiguous=False,
+            )
+
+    # Sidecar JSON
+    probe = fnv.file.ImagerFile(str(ats_path))
+    meta = {
+        "source_file": str(ats_path),
+        "hottest_frame_index": int(best_idx),
+        "hottest_frame_mean_adc_count": float(best_mean_count),
+        "test_emissivity_values": [float(e) for e in emissivities],
+        "pixel_unit_written": "celsius" if unit == "celsius" else "kelvin",
+        "data_type_in_tiff": "float32",
+        "scene_height": int(H),
+        "scene_width":  int(W),
+        "label_strip_height": int(strip_h),
+        "label_strip_bg_value": float(bg_val),
+        "label_strip_fg_value": float(fg_val),
+        "tiff_layout": (
+            f"Each page is the hottest frame (index {best_idx}) of the "
+            "source .ats, re-decoded in Unit.TEMPERATURE_FACTORY with "
+            "object_parameters.emissivity = test_emissivity_values[page]. "
+            "All other object_parameters were left at their recorded "
+            f"values.  A {strip_h}-row label strip is appended at the "
+            "bottom of every page (white text 'emissivity = X.XXX' on a "
+            f"dark background).  The real scene area is the top {H} rows."
+        ),
+        "per_page_summary": page_stats,
+        "shared_object_parameters_recorded": _jsonable(probe.object_parameters),
+        "source_info": _jsonable(probe.source_info),
+        "preset_info": _jsonable(list(probe.source_info.preset_info)),
+    }
+    out_json.write_text(json.dumps(meta, indent=2, default=str))
+
+    return {
+        "status": "ok",
+        "tif_mb": out_tif.stat().st_size / 1e6,
+        "n_pages": len(pages),
+        "hottest_frame": int(best_idx),
+        "elapsed_s": time.time() - t0,
+    }
+
+
 # ---------- Mode prompt and dispatcher helpers ----------------------------
 def prompt_mode() -> str:
     """Return 'test' or 'batch'."""
@@ -647,42 +825,42 @@ def _scan_ats(args, input_dir: Path) -> list[Path]:
 # ---------- Test mode -----------------------------------------------------
 def test_mode(args, input_dir: Path, output_dir: Path,
               all_ats_files: list[Path]) -> str:
-    """Iterative emissivity-sweep loop on a single .ats per round.
+    """Iterative emissivity-sweep loop.  Each round picks ONE .ats file
+    and a list of emissivity values, finds the hottest frame in that
+    file, and writes a single multi-page TIFF where each page is the
+    hottest frame re-decoded with one emissivity (a 'emissivity = X.XXX'
+    white-on-dark label strip is burnt into the bottom of each page).
+
     Returns 'batch' to continue into batch mode, or 'exit' to stop."""
     print()
     print("=== Test mode (emissivity sweep) ===")
     print(f"  input dir:  {input_dir}")
     print(f"  output dir: {output_dir}")
     print(f"  unit:       {args.unit}")
-    print("  Other radiometric parameters stay at each file's recorded "
-          "values; only emissivity is varied per output file.")
+    print("  Per round: one .ats file -> one stack TIFF, one page per")
+    print("  emissivity value, hottest frame only.  All other object")
+    print("  parameters stay at each file's recorded values.")
 
     while True:
         ats = prompt_single_file(all_ats_files, input_dir)
         eps_list = prompt_emissivity_values()
 
-        print(f"\n[test] {len(eps_list)} sweep step(s) on {ats.name}",
-              flush=True)
-        sweep_t0 = time.time()
-        for j, eps in enumerate(eps_list, 1):
-            suffix = f"_eps{eps:.3f}"
-            print(f"--- [{j}/{len(eps_list)}] emissivity = {eps:.3f} "
-                  f"(suffix={suffix}) ---", flush=True)
-            try:
-                r = convert_one(ats, output_dir,
-                                unit=args.unit,
-                                overrides={"emissivity": eps},
-                                overwrite=args.overwrite,
-                                stem_suffix=suffix)
-                print(f"  -> {r['status']}", flush=True)
-            except KeyboardInterrupt:
-                print("\n[interrupt] aborting current sweep")
-                break
-            except Exception as exc:
-                print(f"  !!! ERROR: {type(exc).__name__}: {exc}",
-                      flush=True)
-        print(f"\n[test] sweep finished in "
-              f"{(time.time()-sweep_t0)/60:.1f} min", flush=True)
+        print(f"\n[test] sweep on {ats.name} with "
+              f"{len(eps_list)} emissivity value(s)", flush=True)
+        try:
+            r = test_sweep_one_file(ats, output_dir, eps_list,
+                                    unit=args.unit,
+                                    overwrite=args.overwrite)
+            print(f"  -> {r['status']}  "
+                  f"({r.get('n_pages', 0)} pages, "
+                  f"{r.get('tif_mb', 0):.2f} MB, "
+                  f"hottest frame = {r.get('hottest_frame', '?')}, "
+                  f"{r.get('elapsed_s', 0):.1f} s)",
+                  flush=True)
+        except KeyboardInterrupt:
+            print("\n[interrupt] aborting current sweep")
+        except Exception as exc:
+            print(f"  !!! ERROR: {type(exc).__name__}: {exc}", flush=True)
 
         action = prompt_post_test_action()
         if action == "test":
