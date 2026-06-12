@@ -100,7 +100,41 @@ Useful flags:
 --unit kelvin       write Kelvin into the TIFF instead of the default Celsius
 --no-recurse        only scan the top level of --input (default scans subfolders)
 --overwrite         re-convert files whose outputs already exist
+--no-confirm        skip the interactive radiometric-parameter prompt and just
+                    use the values recorded inside each .ats verbatim
 ```
+
+### Radiometric parameter inspection (default)
+
+Before processing any file, the script prints the radiometric inversion
+parameters recorded in the first `.ats` and lets you override any of them:
+
+```
+  Radiometric inversion parameters (recorded inside the first .ats):
+  name                            value  unit         description
+  ----------------------------    -----  ------------ --------------------
+  emissivity                     0.9200  0-1 (-)      surface emissivity
+  reflected_temp               293.1500  Kelvin       reflected (background) temperature
+  distance                       1.0000  metres       target distance
+  atmosphere_temp              293.1500  Kelvin       atmospheric temperature
+  relative_humidity              0.3000  0-1 (-)      relative humidity
+  atmospheric_transmission       0.9735  0-1 (-)      atmospheric transmission
+  ext_optics_temp              293.1500  Kelvin       external optics temperature
+  ext_optics_transmission        1.0000  0-1 (-)      external optics transmission
+
+  Do you want to override any of them? [y/N]:
+```
+
+Press Enter at any per-parameter prompt to keep its value. Any
+overrides you confirm are applied to **every** file in the batch
+before the FLIR SDK computes temperatures. The recorded values and
+the applied overrides are both written into each `*_meta.json` so the
+run is fully reproducible.
+
+The source `.ats` files are never modified by this tool. If you want
+to abandon an overridden run and re-process with the original
+parameters, delete the outputs (or pass `--overwrite`) and re-run with
+`--no-confirm`.
 
 The tool reports a per-file progress line and an end-of-batch summary:
 

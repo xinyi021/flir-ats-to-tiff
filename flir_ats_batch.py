@@ -43,6 +43,22 @@ Usage:
 
     python flir_ats_batch.py --overwrite
         (re-encode files whose outputs already exist; default skips them)
+
+    python flir_ats_batch.py --no-confirm
+        (skip the interactive radiometric-parameter inspection / override
+        prompt; just use the values recorded inside each .ats verbatim)
+
+Object-parameter inspection (default behaviour):
+    Before the batch starts the script opens the FIRST .ats file in the
+    input folder and prints its radiometric inversion parameters --
+    emissivity, reflected temperature, distance, atmospheric temperature,
+    relative humidity, atmospheric transmission, external optics
+    temperature and transmission.  You can then optionally override any
+    of them by typing a new number at the per-parameter prompts; any
+    overrides are applied to EVERY file in the batch before the SDK
+    computes temperatures.  The original .ats files are never modified;
+    the recorded values and the applied overrides are both written into
+    each *_meta.json so the run is reproducible.
 """
 from __future__ import annotations
 import argparse
@@ -126,7 +142,8 @@ def _jsonable(x):
     return out
 
 
-def collect_metadata(f, *, n_frames, preview_idx, preview_mean, unit_label):
+def collect_metadata(f, *, n_frames, preview_idx, preview_mean, unit_label,
+                     recorded_object_params=None, applied_overrides=None):
     return {
         "n_frames": int(n_frames),
         "width": int(f.width),
@@ -149,21 +166,114 @@ def collect_metadata(f, *, n_frames, preview_idx, preview_mean, unit_label):
                 "recording (= overall hottest frame)"
             ),
         },
+        "object_parameters_recorded": recorded_object_params,
+        "object_parameters_applied": _jsonable(f.object_parameters),
+        "object_parameter_overrides": applied_overrides or {},
         "raw_counts_recovery": (
             "Reopen the source .ats through the FLIR Science File SDK and "
             "set f.unit = fnv.Unit.COUNTS to get the unchanged 14-bit ADC "
             "counts back.  This tool does not modify the source .ats files."
         ),
         "source_info": _jsonable(f.source_info),
-        "object_parameters": _jsonable(f.object_parameters),
         "current_preset_index": int(f.preset),
         "preset_info": _jsonable(list(f.source_info.preset_info)),
     }
 
 
+# ---------- Object-parameter inspection / override -------------------------
+# Names of the radiometric inversion knobs we expose to the user.  Each
+# entry is (sdk attribute, display unit, short description).  Loaded from
+# the SDK's ObjectParameters class.
+OBJECT_PARAM_FIELDS = [
+    ("emissivity",               "0-1 (-)",   "surface emissivity"),
+    ("reflected_temp",           "Kelvin",    "reflected (background) temperature"),
+    ("distance",                 "metres",    "target distance"),
+    ("atmosphere_temp",          "Kelvin",    "atmospheric temperature"),
+    ("relative_humidity",        "0-1 (-)",   "relative humidity"),
+    ("atmospheric_transmission", "0-1 (-)",   "atmospheric transmission"),
+    ("ext_optics_temp",          "Kelvin",    "external optics temperature"),
+    ("ext_optics_transmission",  "0-1 (-)",   "external optics transmission"),
+]
+
+
+def read_object_params(f) -> dict[str, float]:
+    """Pull the current numeric value of every field we care about."""
+    out = {}
+    for name, _, _ in OBJECT_PARAM_FIELDS:
+        try:
+            out[name] = float(getattr(f.object_parameters, name))
+        except Exception:
+            out[name] = float("nan")
+    return out
+
+
+def print_object_params(params: dict[str, float], heading: str) -> None:
+    print(f"\n  {heading}")
+    print(f"  {'name':<28s}  {'value':>12s}  unit         description")
+    print(f"  {'-'*28}  {'-'*12}  {'-'*12} {'-'*40}")
+    for name, unit, desc in OBJECT_PARAM_FIELDS:
+        v = params.get(name, float("nan"))
+        print(f"  {name:<28s}  {v:>12.4f}  {unit:<12s} {desc}")
+
+
+def prompt_object_param_overrides(initial: dict[str, float]) -> dict[str, float]:
+    """Display the recorded parameters and let the user override any of
+    them.  Returns the final dict (initial + overrides).  Loops until the
+    user confirms."""
+    while True:
+        print_object_params(initial, "Radiometric inversion parameters "
+                            "(recorded inside the first .ats):")
+        print("\n  These were applied during the recording.  Press Enter at "
+              "each prompt to keep the recorded value, or type a new number.")
+        modify = input("\n  Do you want to override any of them? [y/N]: "
+                       ).strip().lower()
+        if modify not in ("y", "yes"):
+            return dict(initial)
+
+        new_vals = dict(initial)
+        for name, unit, desc in OBJECT_PARAM_FIELDS:
+            cur = new_vals[name]
+            raw = input(f"    {name} [{cur:.4f} {unit}]: ").strip()
+            if not raw:
+                continue
+            try:
+                new_vals[name] = float(raw)
+            except ValueError:
+                print(f"      not a number, keeping {cur:.4f}")
+
+        if new_vals == initial:
+            print("  (no values changed)")
+            return new_vals
+
+        print_object_params(new_vals,
+                            "Parameters that WILL be applied to every file:")
+        confirm = input("\n  Proceed with these values? [y/N/edit]: "
+                        ).strip().lower()
+        if confirm in ("y", "yes"):
+            return new_vals
+        if confirm in ("e", "edit"):
+            initial = new_vals    # iterate again on top of the edited copy
+            continue
+        print("  Cancelled; you can edit again.\n")
+        initial = new_vals
+        continue
+
+
+def apply_overrides(f, overrides: dict[str, float]) -> None:
+    """Write each override into f.object_parameters before frame reads."""
+    op = f.object_parameters
+    for name, val in overrides.items():
+        try:
+            setattr(op, name, float(val))
+        except Exception as exc:
+            print(f"    [warn] could not set object_parameters.{name} = "
+                  f"{val!r}: {exc!r}", flush=True)
+
+
 # ---------- Per-file conversion -------------------------------------------
 def convert_one(ats_path: Path, out_dir: Path,
                 *, unit: str = "celsius",
+                overrides: dict[str, float] | None = None,
                 overwrite: bool = False) -> dict:
     """Convert one .ats into _temp_{C|K}.tif + _meta.json + _preview.png."""
     if unit not in ("celsius", "kelvin"):
@@ -184,10 +294,21 @@ def convert_one(ats_path: Path, out_dir: Path,
 
     t0 = time.time()
     f = fnv.file.ImagerFile(str(ats_path))
+
+    # Snapshot the recorded object_parameters before any override, so the
+    # JSON can show both what was in the .ats and what we actually used.
+    recorded = read_object_params(f)
+
+    # Apply user-supplied object-parameter overrides BEFORE switching
+    # to a temperature unit, so the SDK's internal radiometric model
+    # uses the new values.
+    if overrides:
+        apply_overrides(f, overrides)
+
     # SDK gives us float32 Kelvin in TEMPERATURE_FACTORY; we shift to
     # Celsius below if asked.  This is the radiometric path that uses
-    # the camera's factory calibration plus the recorded object
-    # parameters (emissivity, distance, reflected temp, etc.).
+    # the camera's factory calibration plus the (possibly overridden)
+    # object parameters (emissivity, distance, reflected temp, etc.).
     f.unit = fnv.Unit.TEMPERATURE_FACTORY
 
     n = int(f.num_frames)
@@ -247,6 +368,8 @@ def convert_one(ats_path: Path, out_dir: Path,
     meta = collect_metadata(
         f, n_frames=n, preview_idx=best_idx,
         preview_mean=best_mean, unit_label=unit_label,
+        recorded_object_params=recorded,
+        applied_overrides=overrides or {},
     )
     meta["source_file"] = str(ats_path)
     out_json.write_text(json.dumps(meta, indent=2, default=str))
@@ -280,6 +403,10 @@ def main():
                     help="Only scan the top level of --input; default is recursive")
     ap.add_argument("--overwrite", action="store_true",
                     help="Re-convert files whose outputs already exist")
+    ap.add_argument("--no-confirm", action="store_true",
+                    help="Skip the interactive object-parameter "
+                         "inspection/override prompt; use the values "
+                         "recorded inside each .ats verbatim")
     args = ap.parse_args()
 
     if args.input is None:
@@ -308,8 +435,37 @@ def main():
     print(f"[setup] {len(ats_files)} .ats files to convert  "
           f"(unit={args.unit}, "
           f"{'overwrite' if args.overwrite else 'skip existing'})")
-    print()
 
+    # ---- Inspect and optionally override radiometric parameters ---------
+    overrides: dict[str, float] = {}
+    if args.no_confirm:
+        print("[setup] --no-confirm: using recorded object_parameters verbatim")
+    else:
+        print(f"\n[setup] Inspecting recorded radiometric parameters from "
+              f"the first file ({ats_files[0].name}) ...")
+        try:
+            probe = fnv.file.ImagerFile(str(ats_files[0]))
+            initial = read_object_params(probe)
+            del probe
+        except Exception as exc:
+            print(f"  [warn] could not read object_parameters from first "
+                  f"file: {exc!r}; falling back to per-file recorded values")
+            initial = None
+
+        if initial is not None:
+            final = prompt_object_param_overrides(initial)
+            overrides = {k: v for k, v in final.items()
+                         if abs(v - initial[k]) > 1e-9}
+            if overrides:
+                print(f"\n[setup] {len(overrides)} parameter(s) will be "
+                      f"overridden on every file:")
+                for k, v in overrides.items():
+                    print(f"          {k} = {v}  (was {initial[k]})")
+            else:
+                print("\n[setup] no overrides -- using each file's recorded "
+                      "values verbatim")
+
+    print()
     results = []
     batch_t0 = time.time()
     for i, ats in enumerate(ats_files, 1):
@@ -318,6 +474,7 @@ def main():
         print(f"=== [{i}/{len(ats_files)}] {rel} ===", flush=True)
         try:
             r = convert_one(ats, args.output, unit=args.unit,
+                            overrides=overrides if overrides else None,
                             overwrite=args.overwrite)
             r["path"] = str(ats)
             print(f"  -> {r['status']}", flush=True)
