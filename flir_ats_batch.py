@@ -1102,18 +1102,31 @@ def test_sweep_one_file(ats_path: Path, out_dir: Path,
     """For ONE .ats file:
       1.  Find the hottest frame (mean ADC count) -- one pass over the
           stack -- unless `hottest_idx` was supplied by an earlier scan.
-      2.  Read that single frame once in Unit.TEMPERATURE_FACTORY.
-      3.  For each test emissivity, exact-Planck-post-correct the
-          frame in Python at `lambda_eff = DEFAULT_LAMBDA_EFF_UM`,
-          apply the user-chosen crop and flip, then prepend a dark
-          label strip with "emissivity = X.XXX" in white at the TOP
-          of the page (so the burnt-in label never occludes pixels).
+      2.  Open the file at Unit.TEMPERATURE_FACTORY and read the
+          recorded emissivity.
+      3.  For each test emissivity, compute that page's temperature
+          map using the best method this file allows:
+            - if `can_change_object_parameters` is True the SDK accepts
+              live emissivity edits, so we set
+              `f.object_parameters.emissivity = eps`, re-read the
+              hottest frame, and let the SDK perform its full band-
+              integrated radiometric inversion (gold standard);
+            - otherwise we read the hottest frame once at the recorded
+              emissivity and post-correct it with the closed-form
+              exact single-wavelength Planck inversion at
+              `DEFAULT_LAMBDA_EFF_UM`.
+          Either way we then apply the user-chosen crop and flip, and
+          prepend a dark label strip with "emissivity = X.XXX" in
+          white at the TOP of the page (so the burnt-in label never
+          occludes pixels).
       4.  Stack the resulting pages into a single multi-page float32
           TIFF.
 
     Output (next to each other):
         <stem>_eps_sweep_temp_{C|K}.tif      one page per emissivity
         <stem>_eps_sweep_meta.json           hottest frame + per-page stats
+                                             + which correction method
+                                             was used
     """
     out_dir.mkdir(parents=True, exist_ok=True)
     stem = ats_path.stem
@@ -1137,21 +1150,45 @@ def test_sweep_one_file(ats_path: Path, out_dir: Path,
     print(f"  hottest frame index = {best_idx}  "
           f"(mean ADC = {best_mean_count:.1f})", flush=True)
 
-    # Read the hottest frame ONCE at the camera's factory calibration.
-    # The SDK locks object_parameters on these ATS files (Unit.USER is
-    # unavailable, can_change_object_parameters is False), so further
-    # emissivity sweeps are done in Python with an exact single-
-    # wavelength Planck post-correction.
+    # Open the file at TEMPERATURE_FACTORY and read the recorded
+    # emissivity.  Two paths depending on whether the SDK accepts live
+    # object_parameters edits on this file:
+    #
+    #   - can_change_object_parameters == True ("sdk_native" path):
+    #     for each test emissivity we set f.object_parameters.emissivity
+    #     to that value, re-read the hottest frame, and let the SDK
+    #     perform its full band-integrated radiometric inversion using
+    #     the camera's factory spectral response.  This is the gold
+    #     standard -- no single-wavelength approximation, no lambda_eff
+    #     guess -- and is what gets used for all "unlocked" ATS files.
+    #
+    #   - can_change_object_parameters == False ("exact_planck" path):
+    #     the SDK refuses live emissivity edits and Unit.TEMPERATURE_USER
+    #     is unavailable, so we read the hottest frame once at the
+    #     recorded emissivity and post-correct it to every requested
+    #     emissivity using the closed-form exact Planck inversion at
+    #     DEFAULT_LAMBDA_EFF_UM.  Accurate to a few percent for moderate
+    #     emissivity ratios; see README.
     f = fnv.file.ImagerFile(str(ats_path))
     f.unit = fnv.Unit.TEMPERATURE_FACTORY
     f.get_frame(best_idx)
     H, W = int(f.height), int(f.width)
-    T_recorded_K = np.asarray(f.final, dtype=np.float32).reshape((H, W))
     eps_recorded = float(f.object_parameters.emissivity)
     sdk_can_change = bool(f.can_change_object_parameters)
     print(f"  recorded emissivity in .ats = {eps_recorded:.4f}  "
           f"(SDK can_change_object_parameters = {sdk_can_change})", flush=True)
-    if not sdk_can_change:
+
+    if sdk_can_change:
+        correction_method = "sdk_native"
+        # We do NOT need to cache T_recorded_K -- each page re-reads
+        # the frame after setting a different emissivity.
+        T_recorded_K = np.asarray(f.final, dtype=np.float32).reshape((H, W))
+        print(f"  SDK accepts live emissivity edits -- using the camera's "
+              f"band-integrated radiometric inversion (no single-wavelength "
+              f"approximation, no lambda_eff guess)", flush=True)
+    else:
+        correction_method = EMISSIVITY_CORRECTION_METHOD
+        T_recorded_K = np.asarray(f.final, dtype=np.float32).reshape((H, W))
         print(f"  SDK does not allow live emissivity changes for this file "
               f"-- using exact-Planck post-correction at lambda_eff = "
               f"{DEFAULT_LAMBDA_EFF_UM} um", flush=True)
@@ -1159,10 +1196,18 @@ def test_sweep_one_file(ats_path: Path, out_dir: Path,
     pages, page_stats = [], []
     unit_sym = "deg C" if unit == "celsius" else "K"
     print(f"  building {len(emissivities)} emissivity page(s) "
-          f"(crop={crop}, flip={flip_mode}) ...", flush=True)
+          f"(crop={crop}, flip={flip_mode}, "
+          f"method={correction_method}) ...", flush=True)
     for j, eps in enumerate(emissivities, 1):
         if abs(eps - eps_recorded) < 1e-9:
             T_new_K = T_recorded_K
+        elif correction_method == "sdk_native":
+            # Ask the SDK to recompute under the new emissivity using
+            # its own factory band-integrated inversion.
+            f.object_parameters.emissivity = float(eps)
+            f.get_frame(best_idx)
+            T_new_K = (np.asarray(f.final, dtype=np.float32)
+                       .reshape((H, W)))
         else:
             T_new_K = emissivity_correct_kelvin(
                 T_recorded_K, eps_recorded, float(eps),
@@ -1237,40 +1282,62 @@ def test_sweep_one_file(ats_path: Path, out_dir: Path,
         "label_strip_fg_value": float(fg_val),
         "tiff_layout": (
             f"Each page is the hottest frame (index {best_idx}) of the "
-            "source .ats, originally decoded in Unit.TEMPERATURE_FACTORY "
-            f"with the recorded emissivity {eps_recorded:.4f}, then "
-            "exact-Planck-post-corrected in Python to the emissivity in "
-            f"test_emissivity_values[page], cropped to {crop} and flipped "
+            "source .ats, decoded in Unit.TEMPERATURE_FACTORY at the "
+            f"emissivity in test_emissivity_values[page] (recorded eps "
+            f"= {eps_recorded:.4f}; correction method = "
+            f"{correction_method!r}), cropped to {crop} and flipped "
             f"({flip_mode}). All other object_parameters were left at "
             f"their recorded values.  A {strip_h}-row label strip is "
             "PREPENDED at the top of every page (white text 'emissivity "
             "= X.XXX' on a dark background); the real scene area is the "
             f"bottom {out_H} rows."
         ),
-        "emissivity_correction": {
-            "method": EMISSIVITY_CORRECTION_METHOD,
-            "formula": (
-                "T_new = C2 / (lambda_eff * "
-                "ln(1 + (eps_new/eps_assumed) "
-                "* (exp(C2/(lambda_eff*T_assumed)) - 1)))"
-            ),
-            "C2_um_K": PLANCK_C2_UM_K,
-            "lambda_eff_um": DEFAULT_LAMBDA_EFF_UM,
-            "eps_assumed_at_decode_time": float(eps_recorded),
-            "reflection_term": "omitted (valid when scene T >> reflected_T)",
-            "approximation_note": (
-                "Exact single-wavelength Planck inversion -- no Wien "
-                "high-T approximation, so accurate at T > 1500 C where "
-                "Wien would overestimate by tens of percent."
-            ),
-            "sdk_constraint": (
-                "FLIR Science File SDK 2026.1.2 reports "
-                "can_change_object_parameters = False for this file, and "
-                "Unit.TEMPERATURE_USER raises 'failed to set unit'; live "
-                "SDK re-computation under a different emissivity is "
-                "therefore not available.  This post-correction is "
-                "the practical alternative."),
-        },
+        "emissivity_correction": (
+            {
+                "method": "sdk_native",
+                "explanation": (
+                    "FLIR Science File SDK 2026.1.2 reported "
+                    "can_change_object_parameters = True for this file, "
+                    "so every test page was produced by setting "
+                    "f.object_parameters.emissivity = "
+                    "test_emissivity_values[page] and re-reading the "
+                    "hottest frame in Unit.TEMPERATURE_FACTORY.  The "
+                    "SDK then performs its full band-integrated Planck "
+                    "inversion using the camera's factory spectral "
+                    "response curve -- no single-wavelength "
+                    "approximation, no lambda_eff guess."
+                ),
+                "eps_recorded_in_ats": float(eps_recorded),
+            }
+            if correction_method == "sdk_native"
+            else {
+                "method": EMISSIVITY_CORRECTION_METHOD,
+                "formula": (
+                    "T_new = C2 / (lambda_eff * "
+                    "ln(1 + (eps_new/eps_assumed) "
+                    "* (exp(C2/(lambda_eff*T_assumed)) - 1)))"
+                ),
+                "C2_um_K": PLANCK_C2_UM_K,
+                "lambda_eff_um": DEFAULT_LAMBDA_EFF_UM,
+                "eps_assumed_at_decode_time": float(eps_recorded),
+                "reflection_term": (
+                    "omitted (valid when scene T >> reflected_T)"),
+                "approximation_note": (
+                    "Exact single-wavelength Planck inversion -- no "
+                    "Wien high-T approximation, so accurate at "
+                    "T > 1500 C where Wien would overestimate by "
+                    "tens of percent."
+                ),
+                "sdk_constraint": (
+                    "FLIR Science File SDK 2026.1.2 reports "
+                    "can_change_object_parameters = False for this "
+                    "file, and Unit.TEMPERATURE_USER raises 'failed "
+                    "to set unit'; live SDK re-computation under a "
+                    "different emissivity is therefore not "
+                    "available.  This post-correction is the "
+                    "practical alternative."),
+            }
+        ),
         "per_page_summary": page_stats,
         "shared_object_parameters_recorded": _jsonable(probe.object_parameters),
         "source_info": _jsonable(probe.source_info),

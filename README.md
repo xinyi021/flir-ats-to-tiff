@@ -181,30 +181,46 @@ Test mode is deliberately frugal:
 
 #### About the emissivity correction
 
-The FLIR Science File SDK 2026.1.2 will not recompute temperature
-under a different emissivity for X6900sc ATS files (it reports
-`can_change_object_parameters = False` and refuses
-`Unit.TEMPERATURE_USER`).  This tool does the re-targeting itself by
-inverting the **single-wavelength Planck radiance ratio** exactly:
+Test mode picks the best method per-file at startup:
 
-```
-                       C2
-T_new = ───────────────────────────────────────────────────────
-        λ_eff · ln(1 + (ε_new/ε_assumed) · (exp(C2/(λ_eff·T_assumed)) − 1))
-```
+- **`sdk_native` path (preferred).**  When the file's
+  `can_change_object_parameters` is True, the script sets
+  `f.object_parameters.emissivity` to each requested test value,
+  re-reads the hottest frame in `Unit.TEMPERATURE_FACTORY`, and lets
+  the FLIR SDK perform its **full band-integrated radiometric
+  inversion** using the camera's factory spectral response curve.
+  No single-wavelength approximation, no `λ_eff` to choose, no
+  reflected-radiance term dropped — gold standard.
 
-with `C2 = 14388 µm·K`, `λ_eff = 3.5 µm` (centre of the X6900sc's
-2-5 µm MWIR pass-band), and the source file's recorded emissivity as
-`ε_assumed`.  The reflected-radiance term is omitted (valid when
-scene `T` is much larger than reflected-environment `T`).  This is
-the Planck law applied exactly at one wavelength — no Wien
-high-temperature approximation — so the result stays accurate well
-above 1500 °C, where the Wien form would overestimate `T_new` by tens
-of percent.  Each `*_eps_sweep_meta.json` records `λ_eff`, `C2`, and
-`ε_assumed`, so the run is reproducible and can be re-derived
-without the SDK.
+- **`exact_planck_single_wavelength` fallback.**  When the SDK
+  reports `can_change_object_parameters = False` (so live ε edits
+  are silently ignored), the script reads the hottest frame once at
+  the recorded ε and post-corrects it via the closed-form Planck
+  inversion at a single effective wavelength:
 
-**See *Temperature calculation and emissivity* below for the full
+  ```
+                         C2
+  T_new = ───────────────────────────────────────────────────────
+          λ_eff · ln(1 + (ε_new/ε_assumed) · (exp(C2/(λ_eff·T_assumed)) − 1))
+  ```
+
+  with `C2 = 14388 µm·K`, `λ_eff = 3.5 µm` (centre of the X6900sc's
+  2-5 µm MWIR pass-band), and the file's recorded emissivity as
+  `ε_assumed`.  Reflected-radiance term omitted (valid when scene
+  `T` ≫ reflected-environment `T`).  No Wien high-T approximation, so
+  the result stays well-defined above 1500 °C, where Wien would
+  overestimate `T_new` by tens of percent.
+
+Each `*_eps_sweep_meta.json` records `emissivity_correction.method`
+plus the relevant parameters (`λ_eff`, `C2`, `ε_assumed` for the
+Planck path; `eps_recorded_in_ats` for the SDK-native path), so the
+output is self-describing and any output is reproducible without the
+SDK.
+
+The startup line `(SDK can_change_object_parameters = True/False)`
+tells you which path test mode took on the current file.
+
+**See *Temperature calculation and emissivity* below for the
 derivation and an honest error budget.**
 
 ```
