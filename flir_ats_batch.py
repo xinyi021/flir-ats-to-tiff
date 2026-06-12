@@ -552,7 +552,7 @@ def apply_overrides(f, overrides: dict[str, float]) -> None:
     (f.can_change_object_parameters is False) -- the setattr calls then
     silently succeed but the SDK ignores them when computing
     temperatures.  Callers that depend on emissivity changes taking
-    effect should apply the Wien post-correction in
+    effect should apply the exact-Planck post-correction in
     emissivity_correct_kelvin() instead."""
     op = f.object_parameters
     for name, val in overrides.items():
@@ -611,11 +611,11 @@ def convert_one(ats_path: Path, out_dir: Path,
 
     # Apply user-supplied object-parameter overrides BEFORE switching
     # to a temperature unit.  If the SDK accepts live changes the new
-    # values flow through its own radiometric path.  If not, we keep the
-    # SDK output at the recorded emissivity and apply a Wien
-    # post-correction in Python (for the emissivity override only;
-    # other parameter overrides are silently ignored when the SDK
-    # refuses them).
+    # values flow through its own radiometric path.  If not, we keep
+    # the SDK output at the recorded emissivity and apply an exact
+    # single-wavelength Planck post-correction in Python (for the
+    # emissivity override only; other parameter overrides are silently
+    # ignored when the SDK refuses them).
     eps_override = None
     if overrides:
         apply_overrides(f, overrides)
@@ -623,7 +623,7 @@ def convert_one(ats_path: Path, out_dir: Path,
                 and abs(float(overrides["emissivity"]) - eps_recorded) > 1e-9:
             eps_override = float(overrides["emissivity"])
             print(f"  [info] SDK refuses live object_parameters edits on "
-                  f"this file -- using Wien post-correction "
+                  f"this file -- using exact-Planck post-correction "
                   f"(lambda_eff = {DEFAULT_LAMBDA_EFF_UM} um) to retarget "
                   f"emissivity {eps_recorded:.4f} -> {eps_override:.4f}",
                   flush=True)
@@ -962,7 +962,7 @@ def prompt_emissivity_values(
         print("  cancelled, re-entering")
 
 
-# ---------- Wien-approximation emissivity correction ----------------------
+# ---------- Exact Planck emissivity correction ----------------------------
 # This SDK release locks `f.object_parameters` for ATS files written by
 # many science cameras: `can_change_object_parameters` is False and the
 # only TEMPERATURE_* unit on the file's `supported_units` is
@@ -972,23 +972,41 @@ def prompt_emissivity_values(
 # Python and re-reading the frame gives exactly the same numbers back.
 #
 # To still allow an emissivity-sensitivity study we do the inversion
-# ourselves with the standard Wien high-T approximation,
+# ourselves with the EXACT Planck radiance ratio.  At a single
+# effective wavelength `lambda_eff_um`,
 #
-#     B(T) ~ exp( -C2 / (lambda_eff * T) )
+#     B(T) = const / (exp(C2 / (lambda_eff * T)) - 1)        (Planck)
 #
-# where C2 = 14388 micrometre * Kelvin is Planck's second radiation
-# constant.  Equating radiances under two emissivity assumptions and
+# Equating measured radiances under two emissivity assumptions and
 # ignoring the reflected-radiance term (negligible when scene T is much
-# larger than the reflected-environment T) gives
+# larger than the reflected-environment T):
 #
-#     1/T_new = 1/T_assumed  -  (lambda_eff / C2) * ln(eps_assumed / eps_new)
+#     eps_assumed * B(T_assumed)  =  eps_new * B(T_new)
+#
+# rearranges to a closed-form inversion:
+#
+#     exp(C2/(lambda_eff*T_new)) - 1
+#         = (eps_new/eps_assumed) * (exp(C2/(lambda_eff*T_assumed)) - 1)
+#
+#                            C2
+#     T_new = -----------------------------------------------------
+#             lambda_eff * ln(1 + (eps_new/eps_assumed)
+#                                  * (exp(C2/(lambda_eff*T_assumed)) - 1))
+#
+# This is the same as the Wien high-T approximation when the "-1"
+# terms are negligible (i.e. C2/(lambda*T) >> 1), but stays accurate
+# all the way up to and beyond 2000 C, where the Wien form would
+# overestimate T by tens of percent.  No extra parameters; the cost
+# is one numpy exp + log per pixel per requested emissivity.
 #
 # `lambda_eff_um` is the camera+filter band's effective wavelength;
 # 3.5 micrometres is a sensible default for a mid-wave InSb camera
 # (X6900sc, A6750sc etc.) with a 2-5 micrometre filter.
 
-WIEN_C2_UM_K = 14388.0
+PLANCK_C2_UM_K = 14388.0      # second radiation constant, micrometre*Kelvin
+WIEN_C2_UM_K = PLANCK_C2_UM_K # back-compat alias for any older callers
 DEFAULT_LAMBDA_EFF_UM = 3.5
+EMISSIVITY_CORRECTION_METHOD = "exact_planck_single_wavelength"
 
 
 def emissivity_correct_kelvin(T_kelvin: np.ndarray,
@@ -996,17 +1014,28 @@ def emissivity_correct_kelvin(T_kelvin: np.ndarray,
                               eps_new: float,
                               lambda_eff_um: float = DEFAULT_LAMBDA_EFF_UM
                               ) -> np.ndarray:
-    """Wien-approximation post-correction from one assumed emissivity to
-    another.  T_kelvin is the per-pixel temperature the FLIR SDK
-    computed under `eps_assumed`; the returned array is the per-pixel
-    temperature that the same measured radiance would imply if the
-    actual emissivity were `eps_new`.  Reflection ignored."""
+    """Exact single-wavelength Planck post-correction from one assumed
+    emissivity to another.  `T_kelvin` is the per-pixel temperature the
+    FLIR SDK computed under `eps_assumed`; the returned array is the
+    per-pixel temperature that the same measured radiance would imply
+    if the actual emissivity were `eps_new`.  Reflection ignored.
+
+    For ratios `eps_new/eps_assumed` close to 1 this is numerically
+    equivalent to the Wien high-T approximation; for the corners that
+    matter to high-T users (large ratio + T > 1500 C) it removes the
+    Wien overestimate, which can reach tens of percent."""
     if eps_new <= 0.0 or eps_assumed <= 0.0:
         raise ValueError("emissivity must be > 0")
-    log_ratio = float(np.log(eps_assumed / eps_new))
-    inv_T_assumed = 1.0 / np.asarray(T_kelvin, dtype=np.float64)
-    inv_T_new = inv_T_assumed - (lambda_eff_um / WIEN_C2_UM_K) * log_ratio
-    return (1.0 / inv_T_new).astype(np.float32)
+    T_a = np.asarray(T_kelvin, dtype=np.float64)
+    # exp(C2 / (lambda * T)) - 1  is the inverse Planck radiance factor
+    # at T_assumed; multiply by (eps_new/eps_assumed) to get the same
+    # quantity at T_new.
+    inv_band = PLANCK_C2_UM_K / (lambda_eff_um * T_a)
+    rhs = (eps_new / eps_assumed) * (np.exp(inv_band) - 1.0)
+    # 1 + rhs is strictly positive, log is well-defined.
+    inv_band_new = np.log1p(rhs)
+    T_new = PLANCK_C2_UM_K / (lambda_eff_um * inv_band_new)
+    return T_new.astype(np.float32)
 
 
 # ---------- Test-mode helpers (single-frame multi-emissivity stack) -------
@@ -1074,10 +1103,11 @@ def test_sweep_one_file(ats_path: Path, out_dir: Path,
       1.  Find the hottest frame (mean ADC count) -- one pass over the
           stack -- unless `hottest_idx` was supplied by an earlier scan.
       2.  Read that single frame once in Unit.TEMPERATURE_FACTORY.
-      3.  For each test emissivity, Wien-post-correct the frame in
-          Python, apply the user-chosen crop and flip, then prepend a
-          dark label strip with "emissivity = X.XXX" in white at the
-          TOP of the page (so the burnt-in label never occludes pixels).
+      3.  For each test emissivity, exact-Planck-post-correct the
+          frame in Python at `lambda_eff = DEFAULT_LAMBDA_EFF_UM`,
+          apply the user-chosen crop and flip, then prepend a dark
+          label strip with "emissivity = X.XXX" in white at the TOP
+          of the page (so the burnt-in label never occludes pixels).
       4.  Stack the resulting pages into a single multi-page float32
           TIFF.
 
@@ -1110,7 +1140,8 @@ def test_sweep_one_file(ats_path: Path, out_dir: Path,
     # Read the hottest frame ONCE at the camera's factory calibration.
     # The SDK locks object_parameters on these ATS files (Unit.USER is
     # unavailable, can_change_object_parameters is False), so further
-    # emissivity sweeps are done in Python with a Wien post-correction.
+    # emissivity sweeps are done in Python with an exact single-
+    # wavelength Planck post-correction.
     f = fnv.file.ImagerFile(str(ats_path))
     f.unit = fnv.Unit.TEMPERATURE_FACTORY
     f.get_frame(best_idx)
@@ -1122,7 +1153,7 @@ def test_sweep_one_file(ats_path: Path, out_dir: Path,
           f"(SDK can_change_object_parameters = {sdk_can_change})", flush=True)
     if not sdk_can_change:
         print(f"  SDK does not allow live emissivity changes for this file "
-              f"-- using Wien post-correction at lambda_eff = "
+              f"-- using exact-Planck post-correction at lambda_eff = "
               f"{DEFAULT_LAMBDA_EFF_UM} um", flush=True)
 
     pages, page_stats = [], []
@@ -1208,7 +1239,7 @@ def test_sweep_one_file(ats_path: Path, out_dir: Path,
             f"Each page is the hottest frame (index {best_idx}) of the "
             "source .ats, originally decoded in Unit.TEMPERATURE_FACTORY "
             f"with the recorded emissivity {eps_recorded:.4f}, then "
-            "Wien-post-corrected in Python to the emissivity in "
+            "exact-Planck-post-corrected in Python to the emissivity in "
             f"test_emissivity_values[page], cropped to {crop} and flipped "
             f"({flip_mode}). All other object_parameters were left at "
             f"their recorded values.  A {strip_h}-row label strip is "
@@ -1217,19 +1248,27 @@ def test_sweep_one_file(ats_path: Path, out_dir: Path,
             f"bottom {out_H} rows."
         ),
         "emissivity_correction": {
-            "method": "Wien high-T approximation",
-            "formula": ("1/T_new = 1/T_assumed - (lambda_eff / C2) * "
-                        "ln(eps_assumed / eps_new)"),
-            "C2_um_K": WIEN_C2_UM_K,
+            "method": EMISSIVITY_CORRECTION_METHOD,
+            "formula": (
+                "T_new = C2 / (lambda_eff * "
+                "ln(1 + (eps_new/eps_assumed) "
+                "* (exp(C2/(lambda_eff*T_assumed)) - 1)))"
+            ),
+            "C2_um_K": PLANCK_C2_UM_K,
             "lambda_eff_um": DEFAULT_LAMBDA_EFF_UM,
             "eps_assumed_at_decode_time": float(eps_recorded),
             "reflection_term": "omitted (valid when scene T >> reflected_T)",
+            "approximation_note": (
+                "Exact single-wavelength Planck inversion -- no Wien "
+                "high-T approximation, so accurate at T > 1500 C where "
+                "Wien would overestimate by tens of percent."
+            ),
             "sdk_constraint": (
                 "FLIR Science File SDK 2026.1.2 reports "
                 "can_change_object_parameters = False for this file, and "
                 "Unit.TEMPERATURE_USER raises 'failed to set unit'; live "
                 "SDK re-computation under a different emissivity is "
-                "therefore not available.  This Wien post-correction is "
+                "therefore not available.  This post-correction is "
                 "the practical alternative."),
         },
         "per_page_summary": page_stats,

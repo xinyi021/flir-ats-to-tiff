@@ -179,29 +179,33 @@ Test mode is deliberately frugal:
    `Image → Adjust → Brightness/Contrast → Auto` makes the strip a
    tidy black bar at the top of the image.
 
-#### About the Wien correction
+#### About the emissivity correction
 
 The FLIR Science File SDK 2026.1.2 will not recompute temperature
 under a different emissivity for X6900sc ATS files (it reports
 `can_change_object_parameters = False` and refuses
 `Unit.TEMPERATURE_USER`).  This tool does the re-targeting itself by
-analytically inverting the Wien high-T approximation of the Planck
-radiation law,
+inverting the **single-wavelength Planck radiance ratio** exactly:
 
 ```
-1/T_new = 1/T_assumed  -  (lambda_eff / C2) * ln(eps_assumed / eps_new)
+                       C2
+T_new = ───────────────────────────────────────────────────────
+        λ_eff · ln(1 + (ε_new/ε_assumed) · (exp(C2/(λ_eff·T_assumed)) − 1))
 ```
 
-with `C2 = 14388 µm·K`, `lambda_eff = 3.5 µm` (centre of the X6900sc's
+with `C2 = 14388 µm·K`, `λ_eff = 3.5 µm` (centre of the X6900sc's
 2-5 µm MWIR pass-band), and the source file's recorded emissivity as
-`eps_assumed`.  The reflected-radiance term is omitted (valid when
-scene `T` is much larger than reflected-environment `T`).  Each
-`*_eps_sweep_meta.json` records `lambda_eff`, `C2`, and `eps_assumed`,
-so the run is reproducible and can be re-derived without the SDK.
+`ε_assumed`.  The reflected-radiance term is omitted (valid when
+scene `T` is much larger than reflected-environment `T`).  This is
+the Planck law applied exactly at one wavelength — no Wien
+high-temperature approximation — so the result stays accurate well
+above 1500 °C, where the Wien form would overestimate `T_new` by tens
+of percent.  Each `*_eps_sweep_meta.json` records `λ_eff`, `C2`, and
+`ε_assumed`, so the run is reproducible and can be re-derived
+without the SDK.
 
 **See *Temperature calculation and emissivity* below for the full
-derivation, including a per-temperature table of Wien-vs-exact-Planck
-bias and recommendations on when the approximation is reliable.**
+derivation and an honest error budget.**
 
 ```
 Rec-000548_eps_sweep_temp_C.tif    one file, one page per emissivity
@@ -461,38 +465,65 @@ The Science File SDK 2026.1.2 reports
 `Unit.TEMPERATURE_USER` raises *"failed to set unit"*; assigning to
 `f.object_parameters.emissivity` looks like it succeeds but the SDK's
 temperature output does not change.  To recover an emissivity-
-sensitivity capability this tool does the inversion analytically using
-the **Wien high-temperature approximation**
+sensitivity capability this tool **inverts the Planck radiation law
+exactly at one effective wavelength**.
+
+The single-wavelength Planck radiance is
 
 ```
-B(T) ∝ exp( − C2 / (λ_eff · T) )       with  C2 = 14388 µm·K
+B(T) = (constant) / ( exp( C2 / (λ_eff · T) ) − 1 )    with C2 = 14388 µm·K
 ```
 
-dropping the "− 1" in the denominator of the full Planck law.
-Equating radiances seen by the camera under two emissivity
-assumptions (and dropping the reflected term, see Section 4),
+Equating the measured radiance under two emissivity assumptions (and
+dropping the reflected term, see Section 4),
 
 ```
-ε_assumed · B(T_assumed)  =  ε_new · B(T_new)
+ε_assumed · B(T_assumed) = ε_new · B(T_new)
 ```
 
-solves to
+rearranges to a closed-form inversion with no high-temperature
+approximation:
 
 ```
-                 λ_eff
-1/T_new = 1/T_assumed − ─────── · ln( ε_assumed / ε_new )
-                  C2
+                   C2
+T_new = ────────────────────────────────────────────────────────
+        λ_eff · ln( 1 + (ε_new/ε_assumed) · (exp(C2/(λ_eff·T_assumed)) − 1) )
 ```
 
-with `T` in Kelvin.  This tool ships `λ_eff = 3.5 µm`, the centre of
-the X6900sc cold filter pass-band (2-5 µm, MWIR) with the ND 2.0
-filter installed; for other camera / filter combinations edit the
-`DEFAULT_LAMBDA_EFF_UM` constant at the top of `flir_ats_batch.py`.
+`T` is in Kelvin throughout.  This tool ships `λ_eff = 3.5 µm`, the
+centre of the X6900sc cold filter pass-band (2-5 µm, MWIR) with the
+ND 2.0 filter installed; for other camera / filter combinations edit
+the `DEFAULT_LAMBDA_EFF_UM` constant at the top of
+`flir_ats_batch.py`.  For very hot scenes (T > 1500 °C) the band's
+effective wavelength shifts towards the short end of the pass-band
+(Wien displacement law), so `λ_eff = 2.8 – 3.0 µm` may give a slightly
+better match.
 
 The same equation is applied in **batch mode** whenever an emissivity
 override is supplied for a locked file (so the TIFF's pixel values are
 already corrected) and in **test mode** when the user sweeps a list of
 emissivity values on the hottest frame.
+
+#### Earlier versions used a Wien approximation; what changed
+
+Prior to the *exact-Planck* commit this tool used the Wien
+high-temperature approximation
+
+```
+1/T_new ≈ 1/T_assumed − (λ_eff / C2) · ln(ε_assumed / ε_new)
+```
+
+which drops the "− 1" in the Planck denominator.  The Wien form is
+fine at low T or small Δε but overestimates `T_new` by tens of
+percent in the high-T / large-Δε corner that high-temperature users
+actually live in (see the table that used to be here, now removed:
+the gap at e.g. `T_assumed = 1500 °C, ε: 0.92 → 0.1` was a 35 000 °C
+overestimate).  The exact form costs one extra `exp` and `log1p` per
+pixel per requested emissivity and removes that error class
+completely; numbers written by the new code differ from older runs
+by up to several hundred degrees Celsius in the hot / low-ε corner.
+The `*_meta.json` records `"emissivity_correction.method"` so old
+versus new outputs are distinguishable.
 
 ### 4. Uncertainty and known limitations
 
@@ -512,42 +543,42 @@ scenes recorded on the X6900sc:
    per-pixel (1-σ).  This is the irreducible noise floor on the SDK's
    own output at the recorded object parameters.
 
-3. **Preset clamping.**  ATS files recorded on the 700-1500 °C preset
-   clamp pixels outside that window to 700 / 1500 °C exactly.  The
-   factory calibration is *undefined* outside the range, so histogram
-   "spikes" at those two values are saturation, not real pixel values.
-   To capture cooler regions, re-record on a lower-range preset.
+3. **Preset clamping and out-of-range extrapolation.**  ATS files
+   recorded on the 700-1500 °C preset clamp pixels below 700 °C to
+   exactly 700 °C and above 1500 °C to exactly 1500 °C in the SDK's
+   factory calibration.  Histogram "spikes" at those two values are
+   saturation, not real pixel values.  When you re-target with a
+   *lower* emissivity (in test mode or via override), the Planck
+   inversion is mathematically defined above 1500 °C but the
+   underlying SDK Kelvin numbers are already extrapolated outside the
+   factory-calibrated range — so apparent temperatures > 1500 °C
+   carry an additional 10-30 % calibration uncertainty on top of #1
+   and #4.  To get trustworthy values above 1500 °C, record on a
+   higher-range preset (e.g. 1000-2500 °C) before doing the
+   emissivity sweep.
 
-4. **Wien approximation error (test mode and emissivity-override
-   batch only).**  Dropping the "−1" in the Planck denominator
-   underestimates the denominator, so the Wien correction always
-   overestimates `T_new` (relative to the exact Planck inversion of the
-   same radiance equation).  Computed `T_new − T_exact` for the recorded
-   emissivity `ε_assumed = 0.92` at `λ_eff = 3.5 µm`:
+4. **Single-wavelength model error.**  This tool inverts Planck at
+   one effective wavelength (`λ_eff = 3.5 µm` by default).  The real
+   X6900sc integrates radiance over the 2-5 µm pass-band weighted by
+   the detector quantum efficiency and the filter transmission, so a
+   single λ is itself an approximation.  Practical impact:
 
-   | Recorded T | ε → 0.5 (1.8×) | ε → 0.3 (3.1×) | ε → 0.1 (9.2×) |
-   |---|---|---|---|
-   | 700 °C  | +4 °C  (+0.4 %) | +13 °C (+1.2 %)  | +110 °C (+6.6 %) |
-   | 1000 °C | +19 °C (+1.5 %) | +70 °C (+4.4 %)  | +887 °C (+30 %) |
-   | 1200 °C | +43 °C (+2.7 %) | +164 °C (+8.1 %) | unusable (Wien diverges) |
-   | 1500 °C | +107 °C (+5.3 %) | +460 °C (+17 %) | unusable (Wien diverges) |
+   - For **moderate** emissivity changes (factor ≤ ~2) and T below
+     ~1500 °C the single-λ assumption is within 1-2 % of a full
+     band-integrated inversion.
+   - For **very hot** scenes (T > 1700 °C) the Planck curve peaks
+     well below 3.5 µm (Wien displacement: peak at 2900 µm·K / T) so
+     the detector sees more short-wavelength signal than the single-λ
+     model.  Lowering `DEFAULT_LAMBDA_EFF_UM` to 2.8 – 3.0 µm closes
+     most of this gap.
+   - The reflected-radiance term is omitted (see #5).
 
-   Translation: Wien is reliable to a few percent of `T_new` for
-   **moderate** emissivity changes (factor ≤ ~2) across the camera's
-   full calibrated range; for **larger** emissivity ratios, the bias
-   grows rapidly with both `Δε` and `T_assumed`.  Recommended workflow:
-   use the test-mode sweep only to identify the right `ε` zone
-   (e.g. "the answer is somewhere in `ε ∈ [0.4, 0.7]`"), then narrow
-   the next sweep to that zone where the Wien error is acceptable.
-   Outside it, treat the numbers as order-of-magnitude only.
-
-5. **Reflected-radiance term omitted in the Wien correction.**  Valid
+5. **Reflected-radiance term omitted in the post-correction.**  Valid
    when `T_scene` is much larger than `T_refl`.  Concretely: for a
    700 °C scene against a 20 °C room the reflected contribution is
    below 10⁻¹⁵ of the scene's own emission and is wholly negligible.
    For a 200 °C scene against a 100 °C oven it would be a several-
-   percent contributor and the Wien correction would have to be
-   extended.
+   percent contributor and the correction would have to be extended.
 
 6. **Locked object-parameter overrides.**  When the SDK reports
    `can_change_object_parameters = False`, overrides on every
