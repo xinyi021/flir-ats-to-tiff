@@ -592,14 +592,22 @@ def parse_emissivity_values(raw: str) -> list[float]:
     return vals
 
 
+DEFAULT_EMISSIVITY_SPEC = "[0.1, 0.95, 0.05]"
+
+
 def prompt_emissivity_values() -> list[float]:
     """Get the list of emissivity values to test from the user.  Repeats
-    on parse error until accepted."""
+    on parse error until accepted.  An empty line is accepted as the
+    default sweep spec (`DEFAULT_EMISSIVITY_SPEC`)."""
     print("\nEmissivity values to test")
     print("  range form:  [start, end, step]   e.g.  [0.3, 0.9, 0.1]")
     print("  list form:   0.3 0.5 0.7   or   0.3,0.5,0.7")
+    print(f"  default (just press Enter): {DEFAULT_EMISSIVITY_SPEC}")
     while True:
         raw = input("Emissivities: ").strip()
+        if not raw:
+            raw = DEFAULT_EMISSIVITY_SPEC
+            print(f"  -> using default: {raw}")
         try:
             vals = parse_emissivity_values(raw)
         except ValueError as exc:
