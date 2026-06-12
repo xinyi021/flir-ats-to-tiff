@@ -292,7 +292,14 @@ def prompt_object_param_overrides(initial: dict[str, float]) -> dict[str, float]
 
 
 def apply_overrides(f, overrides: dict[str, float]) -> None:
-    """Write each override into f.object_parameters before frame reads."""
+    """Write each override into f.object_parameters before frame reads.
+
+    Note: many ATS files lock object_parameters at the SDK level
+    (f.can_change_object_parameters is False) -- the setattr calls then
+    silently succeed but the SDK ignores them when computing
+    temperatures.  Callers that depend on emissivity changes taking
+    effect should apply the Wien post-correction in
+    emissivity_correct_kelvin() instead."""
     op = f.object_parameters
     for name, val in overrides.items():
         try:
@@ -334,17 +341,28 @@ def convert_one(ats_path: Path, out_dir: Path,
     # Snapshot the recorded object_parameters before any override, so the
     # JSON can show both what was in the .ats and what we actually used.
     recorded = read_object_params(f)
+    eps_recorded = float(recorded.get("emissivity", 1.0))
+    sdk_can_change = bool(getattr(f, "can_change_object_parameters", False))
 
     # Apply user-supplied object-parameter overrides BEFORE switching
-    # to a temperature unit, so the SDK's internal radiometric model
-    # uses the new values.
+    # to a temperature unit.  If the SDK accepts live changes the new
+    # values flow through its own radiometric path.  If not, we keep the
+    # SDK output at the recorded emissivity and apply a Wien
+    # post-correction in Python (for the emissivity override only;
+    # other parameter overrides are silently ignored when the SDK
+    # refuses them).
+    eps_override = None
     if overrides:
         apply_overrides(f, overrides)
+        if (not sdk_can_change) and "emissivity" in overrides \
+                and abs(float(overrides["emissivity"]) - eps_recorded) > 1e-9:
+            eps_override = float(overrides["emissivity"])
+            print(f"  [info] SDK refuses live object_parameters edits on "
+                  f"this file -- using Wien post-correction "
+                  f"(lambda_eff = {DEFAULT_LAMBDA_EFF_UM} um) to retarget "
+                  f"emissivity {eps_recorded:.4f} -> {eps_override:.4f}",
+                  flush=True)
 
-    # SDK gives us float32 Kelvin in TEMPERATURE_FACTORY; we shift to
-    # Celsius below if asked.  This is the radiometric path that uses
-    # the camera's factory calibration plus the (possibly overridden)
-    # object parameters (emissivity, distance, reflected temp, etc.).
     f.unit = fnv.Unit.TEMPERATURE_FACTORY
 
     n = int(f.num_frames)
@@ -367,8 +385,14 @@ def convert_one(ats_path: Path, out_dir: Path,
     with tifffile.TiffWriter(str(out_tif), bigtiff=True) as tw:
         for i in range(n):
             f.get_frame(i)
-            page = (np.asarray(f.final, dtype=np.float32)
-                    .reshape((H, W)) + offset)
+            page_K = (np.asarray(f.final, dtype=np.float32)
+                      .reshape((H, W)))
+            if eps_override is not None:
+                page_K = emissivity_correct_kelvin(
+                    page_K, eps_recorded, eps_override,
+                    lambda_eff_um=DEFAULT_LAMBDA_EFF_UM,
+                )
+            page = page_K + offset
             tw.write(
                 page, photometric="minisblack",
                 compression="zlib", compressionargs={"level": ZLIB_LEVEL},
@@ -591,6 +615,53 @@ def prompt_emissivity_values() -> list[float]:
         print("  cancelled, re-entering")
 
 
+# ---------- Wien-approximation emissivity correction ----------------------
+# This SDK release locks `f.object_parameters` for ATS files written by
+# many science cameras: `can_change_object_parameters` is False and the
+# only TEMPERATURE_* unit on the file's `supported_units` is
+# TEMPERATURE_FACTORY (trying to set f.unit = TEMPERATURE_USER raises
+# 'failed to set unit').  That means setting f.object_parameters.* has
+# NO EFFECT on the SDK's temperature output -- changing emissivity in
+# Python and re-reading the frame gives exactly the same numbers back.
+#
+# To still allow an emissivity-sensitivity study we do the inversion
+# ourselves with the standard Wien high-T approximation,
+#
+#     B(T) ~ exp( -C2 / (lambda_eff * T) )
+#
+# where C2 = 14388 micrometre * Kelvin is Planck's second radiation
+# constant.  Equating radiances under two emissivity assumptions and
+# ignoring the reflected-radiance term (negligible when scene T is much
+# larger than the reflected-environment T) gives
+#
+#     1/T_new = 1/T_assumed  -  (lambda_eff / C2) * ln(eps_assumed / eps_new)
+#
+# `lambda_eff_um` is the camera+filter band's effective wavelength;
+# 3.5 micrometres is a sensible default for a mid-wave InSb camera
+# (X6900sc, A6750sc etc.) with a 2-5 micrometre filter.
+
+WIEN_C2_UM_K = 14388.0
+DEFAULT_LAMBDA_EFF_UM = 3.5
+
+
+def emissivity_correct_kelvin(T_kelvin: np.ndarray,
+                              eps_assumed: float,
+                              eps_new: float,
+                              lambda_eff_um: float = DEFAULT_LAMBDA_EFF_UM
+                              ) -> np.ndarray:
+    """Wien-approximation post-correction from one assumed emissivity to
+    another.  T_kelvin is the per-pixel temperature the FLIR SDK
+    computed under `eps_assumed`; the returned array is the per-pixel
+    temperature that the same measured radiance would imply if the
+    actual emissivity were `eps_new`.  Reflection ignored."""
+    if eps_new <= 0.0 or eps_assumed <= 0.0:
+        raise ValueError("emissivity must be > 0")
+    log_ratio = float(np.log(eps_assumed / eps_new))
+    inv_T_assumed = 1.0 / np.asarray(T_kelvin, dtype=np.float64)
+    inv_T_new = inv_T_assumed - (lambda_eff_um / WIEN_C2_UM_K) * log_ratio
+    return (1.0 / inv_T_new).astype(np.float32)
+
+
 # ---------- Test-mode helpers (single-frame multi-emissivity stack) -------
 def _find_font(size: int):
     """Best-effort TrueType font; fall back to PIL's tiny bitmap."""
@@ -677,19 +748,38 @@ def test_sweep_one_file(ats_path: Path, out_dir: Path,
     print(f"  hottest frame index = {best_idx}  "
           f"(mean ADC = {best_mean_count:.1f})", flush=True)
 
+    # Read the hottest frame ONCE at the camera's factory calibration.
+    # The SDK locks object_parameters on these ATS files (Unit.USER is
+    # unavailable, can_change_object_parameters is False), so further
+    # emissivity sweeps are done in Python with a Wien post-correction.
+    f = fnv.file.ImagerFile(str(ats_path))
+    f.unit = fnv.Unit.TEMPERATURE_FACTORY
+    f.get_frame(best_idx)
+    H, W = int(f.height), int(f.width)
+    T_recorded_K = np.asarray(f.final, dtype=np.float32).reshape((H, W))
+    eps_recorded = float(f.object_parameters.emissivity)
+    sdk_can_change = bool(f.can_change_object_parameters)
+    print(f"  recorded emissivity in .ats = {eps_recorded:.4f}  "
+          f"(SDK can_change_object_parameters = {sdk_can_change})", flush=True)
+    if not sdk_can_change:
+        print(f"  SDK does not allow live emissivity changes for this file "
+              f"-- using Wien post-correction at lambda_eff = "
+              f"{DEFAULT_LAMBDA_EFF_UM} um", flush=True)
+
     pages, page_stats = [], []
-    H = W = None
     unit_sym = "deg C" if unit == "celsius" else "K"
-    print(f"  rendering {len(emissivities)} emissivity page(s) ...", flush=True)
+    print(f"  building {len(emissivities)} emissivity page(s) ...", flush=True)
     for j, eps in enumerate(emissivities, 1):
-        f = fnv.file.ImagerFile(str(ats_path))
-        apply_overrides(f, {"emissivity": float(eps)})
-        f.unit = fnv.Unit.TEMPERATURE_FACTORY
-        f.get_frame(best_idx)
-        if H is None:
-            H, W = int(f.height), int(f.width)
-        kelvin = np.asarray(f.final, dtype=np.float32).reshape((H, W))
-        page = kelvin - (KELVIN_OFFSET if unit == "celsius" else 0.0)
+        if abs(eps - eps_recorded) < 1e-9:
+            T_new_K = T_recorded_K
+        else:
+            T_new_K = emissivity_correct_kelvin(
+                T_recorded_K, eps_recorded, float(eps),
+                lambda_eff_um=DEFAULT_LAMBDA_EFF_UM,
+            )
+        page = (T_new_K
+                - (KELVIN_OFFSET if unit == "celsius" else 0.0)
+                ).astype(np.float32)
         pages.append(page)
         page_stats.append({
             "page_index": j - 1,
@@ -741,13 +831,31 @@ def test_sweep_one_file(ats_path: Path, out_dir: Path,
         "label_strip_fg_value": float(fg_val),
         "tiff_layout": (
             f"Each page is the hottest frame (index {best_idx}) of the "
-            "source .ats, re-decoded in Unit.TEMPERATURE_FACTORY with "
-            "object_parameters.emissivity = test_emissivity_values[page]. "
-            "All other object_parameters were left at their recorded "
-            f"values.  A {strip_h}-row label strip is appended at the "
-            "bottom of every page (white text 'emissivity = X.XXX' on a "
-            f"dark background).  The real scene area is the top {H} rows."
+            "source .ats, originally decoded in Unit.TEMPERATURE_FACTORY "
+            f"with the recorded emissivity {eps_recorded:.4f}, then "
+            "Wien-post-corrected in Python to the emissivity in "
+            "test_emissivity_values[page]. All other object_parameters "
+            f"were left at their recorded values.  A {strip_h}-row label "
+            "strip is appended at the bottom of every page (white text "
+            "'emissivity = X.XXX' on a dark background).  The real scene "
+            f"area is the top {H} rows."
         ),
+        "emissivity_correction": {
+            "method": "Wien high-T approximation",
+            "formula": ("1/T_new = 1/T_assumed - (lambda_eff / C2) * "
+                        "ln(eps_assumed / eps_new)"),
+            "C2_um_K": WIEN_C2_UM_K,
+            "lambda_eff_um": DEFAULT_LAMBDA_EFF_UM,
+            "eps_assumed_at_decode_time": float(eps_recorded),
+            "reflection_term": "omitted (valid when scene T >> reflected_T)",
+            "sdk_constraint": (
+                "FLIR Science File SDK 2026.1.2 reports "
+                "can_change_object_parameters = False for this file, and "
+                "Unit.TEMPERATURE_USER raises 'failed to set unit'; live "
+                "SDK re-computation under a different emissivity is "
+                "therefore not available.  This Wien post-correction is "
+                "the practical alternative."),
+        },
         "per_page_summary": page_stats,
         "shared_object_parameters_recorded": _jsonable(probe.object_parameters),
         "source_info": _jsonable(probe.source_info),

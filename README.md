@@ -137,15 +137,46 @@ Test mode is deliberately frugal:
 1. It does ONE fast pass over the recording (`Unit.COUNTS`, uint16)
    to find the frame with the highest mean ADC count -- that's the
    hottest frame.
-2. For every emissivity value you asked for, only that single frame is
-   re-decoded with the override applied.
-3. All the results are packed into a single small multi-page float32
-   TIFF where each page is one emissivity result.  A 28-row label
-   strip is burnt in at the bottom of every page showing
-   `emissivity = X.XXX` in white text on a dark band.  In Fiji you
-   scroll-wheel through the stack, the label tells you which page
-   you're looking at, and `Image → Adjust → Brightness/Contrast → Auto`
-   makes the strip a tidy black bar at the bottom of the image.
+2. That single frame is decoded once in `Unit.TEMPERATURE_FACTORY`
+   using the emissivity baked into the recording.
+3. For every emissivity value you asked for, a Wien high-T
+   post-correction is applied in Python (see "About the Wien
+   correction" below) and the result is appended as one page of a
+   single multi-page float32 TIFF.  A 28-row label strip is burnt in
+   at the bottom of every page showing `emissivity = X.XXX` in white
+   text on a dark band.  In Fiji you scroll-wheel through the stack,
+   the label tells you which page you're looking at, and `Image →
+   Adjust → Brightness/Contrast → Auto` makes the strip a tidy black
+   bar at the bottom of the image.
+
+#### About the Wien correction
+
+The FLIR Science File SDK 2026.1.2 reports
+`can_change_object_parameters = False` for ATS files written by many
+science cameras (including the X6900sc), and trying to set
+`f.unit = fnv.Unit.TEMPERATURE_USER` raises *"failed to set unit"*.
+The SDK therefore refuses to recompute temperature live under a
+different emissivity assumption -- assigning to
+`f.object_parameters.emissivity` looks like it succeeds but the SDK's
+TEMPERATURE_FACTORY output is unchanged.
+
+To still allow an emissivity-sensitivity study this tool does the
+inversion analytically in Python using the Wien high-T approximation,
+
+```
+1/T_new = 1/T_assumed  -  (lambda_eff / C2) * ln(eps_assumed / eps_new)
+```
+
+with `C2 = 14388 micrometre * Kelvin`, the camera's recorded emissivity
+as `eps_assumed`, and `lambda_eff = 3.5 micrometre` as a sensible
+default for a mid-wave InSb camera with a 2-5 micrometre filter. The
+reflected-radiance term is omitted; this is accurate when scene
+temperatures are much larger than the reflected-environment
+temperature (the common high-T use case).
+
+The `*_eps_sweep_meta.json` records the assumption, the wavelength,
+and the recorded emissivity used as `eps_assumed`, so the run is
+reproducible and can be re-derived without the SDK.
 
 ```
 Rec-000548_eps_sweep_temp_C.tif    one file, one page per emissivity
