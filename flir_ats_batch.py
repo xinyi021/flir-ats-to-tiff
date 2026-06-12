@@ -1361,6 +1361,24 @@ def plot_sweep_results(page_stats: list[dict],
         return written
 
     # ---- Two-dimensional case --------------------------------------
+    # `import` here so the module still loads cleanly when matplotlib
+    # is missing; we only reach this branch when _HAVE_MATPLOTLIB.
+    import matplotlib.patheffects as path_effects
+
+    def _label_inside(ax, text: str) -> None:
+        """Anchor a small param label in the subplot's upper-right
+        corner with a translucent white halo so it sits above grid
+        lines and any plotted curves."""
+        ax.text(
+            0.985, 0.94, text,
+            transform=ax.transAxes,
+            ha="right", va="top",
+            fontsize=10,
+            bbox=dict(boxstyle="round,pad=0.25",
+                      facecolor="white", alpha=0.85,
+                      edgecolor="0.6", linewidth=0.5),
+        )
+
     # Stacked-subplot 1: one subplot per lambda, x = eps.
     fig, axes = plt.subplots(
         n_lam, 1,
@@ -1374,10 +1392,13 @@ def plot_sweep_results(page_stats: list[dict],
         ax.plot(emissivities, T_min[i], "o-", color="C0", label="T_min")
         ax.plot(emissivities, T_max[i], "o-", color="C1", label="T_max")
         ax.set_ylabel(f"T (deg {unit_sym})")
-        ax.set_title(f"lambda_eff = {lam:.3f} um", fontsize=10)
         ax.grid(True, alpha=0.3)
+        # Show x-tick numeric labels on every subplot, not only the
+        # bottom one (overrides sharex's default of hiding them).
+        ax.tick_params(labelbottom=True)
+        _label_inside(ax, f"lambda_eff = {lam:.3f} um")
         if i == 0:
-            ax.legend(loc="upper right")
+            ax.legend(loc="upper left")
     axes[-1].set_xlabel("emissivity")
     fig.suptitle(
         f"{stem}: hottest-frame T vs emissivity, stacked by lambda_eff",
@@ -1400,10 +1421,11 @@ def plot_sweep_results(page_stats: list[dict],
         ax.plot(lambda_eff_values, T_max[:, j], "o-", color="C1",
                 label="T_max")
         ax.set_ylabel(f"T (deg {unit_sym})")
-        ax.set_title(f"eps = {eps:.3f}", fontsize=10)
         ax.grid(True, alpha=0.3)
+        ax.tick_params(labelbottom=True)
+        _label_inside(ax, f"eps = {eps:.3f}")
         if j == 0:
-            ax.legend(loc="upper right")
+            ax.legend(loc="upper left")
     axes[-1].set_xlabel("lambda_eff (um)")
     fig.suptitle(
         f"{stem}: hottest-frame T vs lambda_eff, stacked by emissivity",
@@ -1425,6 +1447,9 @@ def plot_sweep_results(page_stats: list[dict],
         )
     x_edges = _edges(eps_arr)
     y_edges = _edges(lam_arr)
+    # Scale the per-cell number font down a bit when there are lots of
+    # cells so they don't visually collide.
+    cell_font_size = max(5.5, min(10.0, 60.0 / max(n_eps, 1)))
     for matrix, kind, cmap in (
         (T_max, "T_max", "inferno"),
         (T_min, "T_min", "viridis"),
@@ -1437,6 +1462,24 @@ def plot_sweep_results(page_stats: list[dict],
         ax.set_title(f"{stem}: {kind} (deg {unit_sym}) across the sweep")
         ax.invert_yaxis()  # smaller lambda at the top reads more naturally
         fig.colorbar(pcm, ax=ax, label=f"{kind} (deg {unit_sym})")
+        # Overlay the numeric temperature at the centre of every cell.
+        # White text with a thin black stroke stays legible on any
+        # colormap value -- no need to flip colour per cell.
+        for i in range(n_lam):
+            for j in range(n_eps):
+                v = matrix[i, j]
+                if not np.isfinite(v):
+                    continue
+                txt = ax.text(
+                    eps_arr[j], lam_arr[i], f"{v:.0f}",
+                    ha="center", va="center",
+                    fontsize=cell_font_size,
+                    color="white",
+                )
+                txt.set_path_effects([
+                    path_effects.Stroke(linewidth=1.4, foreground="black"),
+                    path_effects.Normal(),
+                ])
         _save(fig, f"heatmap_{kind.lower()}")
 
     return written
