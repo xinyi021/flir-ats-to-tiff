@@ -14,9 +14,9 @@ folder:
 
 | File | Content |
 |---|---|
-| `Rec-NNNNNN_temp_C.tif` (or `_temp_K.tif`) | Multi-page BigTIFF, every page is one camera frame stored as `float32` Celsius (default) or Kelvin. Bit-for-bit the SDK's `Unit.TEMPERATURE_FACTORY` output (optionally shifted by 273.15). zlib level 5. |
-| `Rec-NNNNNN_meta.json` | Camera (model, serial, lens, filter), recording (frame rate, integration time, temperature range), and object parameters (emissivity, distance, reflected / atmospheric temperature, humidity). |
-| `Rec-NNNNNN_preview.png` | One 8-bit grayscale preview frame, selected as the frame with the highest mean temperature across the whole recording (= the overall hottest moment). The frame index is recorded in the JSON. |
+| `Rec-NNNNNN_eps0.92_temp_C.tif` (or `_temp_K.tif`) | Multi-page BigTIFF, every page is one camera frame stored as `float32` Celsius (default) or Kelvin. The `_epsX.XX_` slot records the emissivity actually used to produce the temperature values (two-decimal-place fixed format; per-file recorded value, or the override if one was applied). Bit-for-bit the SDK's `Unit.TEMPERATURE_FACTORY` output (optionally shifted by 273.15). zlib level 5. |
+| `Rec-NNNNNN_eps0.92_meta.json` | Camera (model, serial, lens, filter), recording (frame rate, integration time, temperature range), object parameters (emissivity, distance, reflected / atmospheric temperature, humidity), and the crop + flip applied to every page. |
+| `Rec-NNNNNN_eps0.92_preview.png` | One 8-bit grayscale preview frame, selected as the frame with the highest mean temperature across the whole recording (= the overall hottest moment). The frame index is recorded in the JSON. |
 
 ### Why float32 temperature instead of raw counts?
 
@@ -136,18 +136,21 @@ Test mode is deliberately frugal:
 
 1. It does ONE fast pass over the recording (`Unit.COUNTS`, uint16)
    to find the frame with the highest mean ADC count -- that's the
-   hottest frame.
+   hottest frame.  The same scan feeds the crop preview PNG so the
+   file is never scanned twice.
 2. That single frame is decoded once in `Unit.TEMPERATURE_FACTORY`
    using the emissivity baked into the recording.
 3. For every emissivity value you asked for, a Wien high-T
    post-correction is applied in Python (see "About the Wien
-   correction" below) and the result is appended as one page of a
-   single multi-page float32 TIFF.  A 28-row label strip is burnt in
-   at the bottom of every page showing `emissivity = X.XXX` in white
-   text on a dark band.  In Fiji you scroll-wheel through the stack,
-   the label tells you which page you're looking at, and `Image →
-   Adjust → Brightness/Contrast → Auto` makes the strip a tidy black
-   bar at the bottom of the image.
+   correction" below), the result is cropped + flipped according to
+   the values you confirmed, and a 28-row label strip is **prepended
+   at the top** of the page (white text `emissivity = X.XXX` on a dark
+   band).  The label sits above the picture so it never occludes any
+   pixel of the real scene.  Each emissivity becomes one page of a
+   single multi-page float32 TIFF.  In Fiji you scroll-wheel through
+   the stack, the label tells you which page you're looking at, and
+   `Image → Adjust → Brightness/Contrast → Auto` makes the strip a
+   tidy black bar at the top of the image.
 
 #### About the Wien correction
 
@@ -194,6 +197,57 @@ batch mode, or quit.
 shared set of parameters for every file. Batch mode never loops back —
 when it finishes the program exits.
 
+### Crop and flip (applied to every output)
+
+After the file-selection (batch) or after picking the test file +
+emissivity values (test), the script asks you to define a crop region
+and an output flip.  Both options are shared across every file
+processed in the same session and are remembered for the next run.
+
+**Crop is described in PRE-FLIP coordinates** so the numbers match
+what you see in a viewer (Fiji, the Windows photo app, etc.) opened
+directly on the source frame.  The grammar is `x_min-x_max y_min-y_max`
+in 1-based inclusive pixel indices; `x` is the width axis, `y` is the
+height axis.  Press Enter / type `none` / `full` to skip the crop.
+
+```
+Crop region (pre-flip coordinates)
+  image size: 640 x 512  (W x H)
+  syntax:   x_min-x_max y_min-y_max  (1-based inclusive)
+  example:  100-540 50-460
+  press Enter (default below), or type 'none' / 'full' to skip crop
+Crop  [Enter = last: 100-540 50-460]: 100-540 50-460
+  -> crop x:100-540 y:50-460  (440 x 410 px)
+  preview PNG written: E:\converted\modulated\_crop_preview.png
+    open it now -- the red rectangle shows what will be kept
+Proceed? [y=confirm / r=reset / c=cancel crop]: y
+```
+
+The preview PNG (`_crop_preview.png`, shared, overwritten on each
+attempt) is built from the hottest frame of the first file in the
+batch (or the file you picked for the test sweep) with a red rectangle
+drawn around the proposed crop region.  Open it in Explorer to
+verify, then `y` to confirm, `r` to enter a different range, or `c` to
+disable the crop entirely.
+
+**Flip is applied AFTER the crop**:
+
+```
+Flip the output image?
+  [1] none     -- no flip
+  [2] hflip    -- horizontal flip (left <-> right)
+  [3] vflip    -- vertical flip (top <-> bottom)
+  [4] rot180   -- 180-degree rotation (= hflip + vflip)
+Choice [1/2/3/4]  [Enter = 4=rot180]:
+```
+
+180-degree rotation is the default because the X6900sc used on this
+project produces upside-down + mirrored frames; the default makes the
+TIFF land in the natural orientation without any further user action.
+
+The applied crop (in 0-based half-open `[x0:x1, y0:y1]` form) and flip
+are recorded in every `*_meta.json` so the run is reproducible.
+
 ### Remembered defaults (press Enter to re-use last run)
 
 Every interactive choice you make is written to
@@ -210,6 +264,8 @@ press-Enter default at each prompt:
           file_selection   = 1-5 10
           test_file_name   = Rec-000548.ats
           emissivity_spec  = [0.1, 0.95, 0.05]
+          crop_spec        = 100-540 50-460
+          flip_mode        = rot180
           object_overrides = {'emissivity': 0.85}
 ```
 
@@ -316,7 +372,7 @@ exposes those as writeable attributes) and convert in
 
 ### In Fiji / ImageJ
 
-`File → Open…`, point at `*_temp_C.tif`. Fiji recognises the BigTIFF
+`File → Open…`, point at `*_eps*_temp_C.tif`. Fiji recognises the BigTIFF
 and opens a 32-bit grayscale stack. Hover your cursor over any pixel and
 the status bar shows the temperature directly. Use `Image → Adjust →
 Brightness/Contrast` and `Auto` to stretch the very narrow real range so
@@ -328,9 +384,10 @@ are unchanged by the display adjustment.
 ```python
 import tifffile, json, numpy as np
 
-stack = tifffile.imread("Rec-000548_temp_C.tif")
-                                          # shape (5311, 512, 640), float32, °C
-meta  = json.loads(open("Rec-000548_meta.json").read())
+stack = tifffile.imread("Rec-000548_eps0.92_temp_C.tif")
+                                          # shape (5311, 410, 440), float32, °C
+                                          # (post-crop + post-flip)
+meta  = json.loads(open("Rec-000548_eps0.92_meta.json").read())
 
 print(stack.shape, stack.dtype, stack.min(), stack.mean(), stack.max())
 print("camera:", meta["source_info"]["camera"],

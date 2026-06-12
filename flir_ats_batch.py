@@ -165,6 +165,222 @@ def save_state(state: dict) -> None:
         pass
 
 
+# ---------- Crop + flip helpers (applied per-frame in pre-flip order) -----
+# Crop is expressed as (x0, x1, y0, y1) in 0-based half-open Python slice
+# coordinates over the PRE-FLIP frame (x = width axis, y = height axis).
+# Flip mode is one of "none", "hflip", "vflip", "rot180" -- 180-degree
+# rotation is equivalent to horizontal + vertical flip and is the default.
+
+FLIP_MODES = ("none", "hflip", "vflip", "rot180")
+DEFAULT_FLIP_MODE = "rot180"
+CROP_PREVIEW_NAME = "_crop_preview.png"
+
+
+def apply_flip(img: np.ndarray, mode: str) -> np.ndarray:
+    """Return a flipped view of a 2D array.  Unknown / empty mode is a
+    no-op.  Output is contiguous so downstream tifffile writes happy."""
+    if not mode or mode == "none":
+        return img
+    if mode == "hflip":
+        return np.ascontiguousarray(img[:, ::-1])
+    if mode == "vflip":
+        return np.ascontiguousarray(img[::-1, :])
+    if mode == "rot180":
+        return np.ascontiguousarray(img[::-1, ::-1])
+    raise ValueError(
+        f"unknown flip mode {mode!r}; choose one of {FLIP_MODES}")
+
+
+def apply_crop(img: np.ndarray,
+               crop: tuple[int, int, int, int] | None) -> np.ndarray:
+    """Apply a `(x0, x1, y0, y1)` half-open crop to a 2D `(H, W)` array.
+    Out-of-range coordinates are clipped silently; an empty intersection
+    raises ValueError so the caller can warn before writing nothing."""
+    if crop is None:
+        return img
+    x0, x1, y0, y1 = crop
+    H, W = img.shape[:2]
+    x0c, x1c = max(0, x0), min(W, x1)
+    y0c, y1c = max(0, y0), min(H, y1)
+    if x0c >= x1c or y0c >= y1c:
+        raise ValueError(
+            f"crop {crop} produces an empty region on {H}x{W} image")
+    return img[y0c:y1c, x0c:x1c]
+
+
+def parse_crop_spec(raw: str, W: int, H: int
+                    ) -> tuple[int, int, int, int] | None:
+    """Parse a 1-based inclusive crop spec like '100-540 50-460' and
+    return a 0-based half-open `(x0, x1, y0, y1)` tuple.  Empty / 'none'
+    / 'full' / 'all' / 'skip' -> None (no crop).  `W` and `H` are the
+    sample frame's width and height; the spec is bounds-checked
+    against them.  x is the width axis, y is the height axis."""
+    raw = raw.strip().lower()
+    if not raw or raw in ("none", "full", "all", "skip"):
+        return None
+    parts = raw.replace(",", " ").split()
+    if len(parts) != 2 or "-" not in parts[0] or "-" not in parts[1]:
+        raise ValueError(
+            "crop spec must look like 'x_min-x_max y_min-y_max' "
+            "(1-based inclusive), e.g. '100-540 50-460'")
+    try:
+        x_lo, x_hi = (int(s) for s in parts[0].split("-", 1))
+        y_lo, y_hi = (int(s) for s in parts[1].split("-", 1))
+    except ValueError as exc:
+        raise ValueError(f"crop spec has non-integer values: {exc}") from exc
+    if x_lo > x_hi:
+        x_lo, x_hi = x_hi, x_lo
+    if y_lo > y_hi:
+        y_lo, y_hi = y_hi, y_lo
+    if not (1 <= x_lo <= W and 1 <= x_hi <= W
+            and 1 <= y_lo <= H and 1 <= y_hi <= H):
+        raise ValueError(
+            f"crop x:{x_lo}-{x_hi} y:{y_lo}-{y_hi} is outside image "
+            f"bounds x:1-{W} y:1-{H}")
+    return (x_lo - 1, x_hi, y_lo - 1, y_hi)
+
+
+def format_crop_spec(crop: tuple[int, int, int, int]) -> str:
+    """Inverse of `parse_crop_spec`, used for round-trip persistence."""
+    x0, x1, y0, y1 = crop
+    return f"{x0 + 1}-{x1} {y0 + 1}-{y1}"
+
+
+def _write_crop_preview(sample: np.ndarray,
+                        crop: tuple[int, int, int, int],
+                        out_path: Path) -> None:
+    """Stretch a 2D sample frame to 8-bit grayscale and draw a red
+    rectangle around the proposed crop region; save as PNG."""
+    lo, hi = np.percentile(sample.astype(np.float32),
+                           [PREVIEW_PCT_LO, PREVIEW_PCT_HI])
+    u8 = np.clip(
+        (sample.astype(np.float32) - lo) / max(hi - lo, 1e-9) * 255.0,
+        0, 255).astype(np.uint8)
+    pil = Image.fromarray(u8, mode="L").convert("RGB")
+    draw = ImageDraw.Draw(pil)
+    x0, x1, y0, y1 = crop
+    # Pillow rectangle is inclusive on both corners.  Use x1-1 / y1-1.
+    draw.rectangle([(x0, y0), (x1 - 1, y1 - 1)],
+                   outline=(255, 0, 0), width=2)
+    pil.save(out_path)
+
+
+def prompt_flip_mode(default: str | None = None) -> str:
+    """Ask the user which post-crop flip to apply.  Empty input accepts
+    `default` (or `DEFAULT_FLIP_MODE` if `default` is None / unknown)."""
+    effective = default if default in FLIP_MODES else DEFAULT_FLIP_MODE
+    print("\nFlip the output image?")
+    print("  [1] none     -- no flip")
+    print("  [2] hflip    -- horizontal flip (left <-> right)")
+    print("  [3] vflip    -- vertical flip (top <-> bottom)")
+    print("  [4] rot180   -- 180-degree rotation (= hflip + vflip)")
+    label = {"none": "1=none", "hflip": "2=hflip",
+             "vflip": "3=vflip", "rot180": "4=rot180"}[effective]
+    tag = f"  [Enter = {label}]"
+    while True:
+        ans = input(f"Choice [1/2/3/4]{tag}: ").strip().lower()
+        if not ans:
+            return effective
+        if ans in ("1", "n", "none"):
+            return "none"
+        if ans in ("2", "h", "hflip"):
+            return "hflip"
+        if ans in ("3", "v", "vflip"):
+            return "vflip"
+        if ans in ("4", "r", "rot180", "180"):
+            return "rot180"
+        print("  please type 1, 2, 3, or 4")
+
+
+def prompt_crop_range(
+        sample_frame: np.ndarray,
+        out_dir: Path,
+        default_spec: str | None = None,
+) -> tuple[tuple[int, int, int, int] | None, str]:
+    """Ask the user for a pre-flip crop region.  Each round writes a
+    grayscale PNG of the sample frame with a red rectangle around the
+    proposed crop (to `out_dir/_crop_preview.png`) and waits for the
+    user to confirm / reset / cancel.
+
+    Returns `(crop, accepted_spec)`:
+      - crop = `(x0, x1, y0, y1)` half-open or None (no crop)
+      - accepted_spec = the spec string suitable for re-offering next
+        run; empty string means 'no crop' (so Enter next time keeps it)
+    """
+    H, W = int(sample_frame.shape[0]), int(sample_frame.shape[1])
+    out_dir.mkdir(parents=True, exist_ok=True)
+    preview_path = out_dir / CROP_PREVIEW_NAME
+
+    print("\nCrop region (pre-flip coordinates)")
+    print(f"  image size: {W} x {H}  (W x H)")
+    print("  syntax:   x_min-x_max y_min-y_max  (1-based inclusive)")
+    print("  example:  100-540 50-460")
+    print("  press Enter (default below), or type 'none' / 'full' to skip crop")
+
+    while True:
+        if default_spec:
+            tag = f"  [Enter = last: {default_spec}]"
+        else:
+            tag = "  [Enter = no crop]"
+        raw = input(f"Crop{tag}: ").strip()
+        if not raw:
+            raw = default_spec or "none"
+            print(f"  -> using default: {raw!r}")
+        try:
+            crop = parse_crop_spec(raw, W, H)
+        except ValueError as exc:
+            print(f"  invalid: {exc}, try again")
+            continue
+        if crop is None:
+            print("  -> no crop will be applied")
+            return None, ""
+
+        _write_crop_preview(sample_frame, crop, preview_path)
+        accepted_spec = format_crop_spec(crop)
+        cw = crop[1] - crop[0]
+        ch = crop[3] - crop[2]
+        print(f"  -> crop x:{crop[0] + 1}-{crop[1]} "
+              f"y:{crop[2] + 1}-{crop[3]}  ({cw} x {ch} px)")
+        print(f"  preview PNG written: {preview_path}")
+        print(f"    open it now -- the red rectangle shows what will be kept")
+        ans = input(
+            "Proceed? [y=confirm / r=reset / c=cancel crop]: "
+        ).strip().lower()
+        if ans in ("y", "yes"):
+            return crop, accepted_spec
+        if ans in ("c", "cancel", "n", "no"):
+            print("  -> crop cancelled, no crop will be applied")
+            return None, ""
+        print("  resetting, re-entering")
+
+
+def _read_hottest_frame_counts(ats_path: Path) -> tuple[int, np.ndarray]:
+    """One scan of `ats_path` in Unit.COUNTS.  Returns
+    `(hottest_idx, hottest_frame_uint16)`.  Cheap relative to the full
+    float32 temperature decode -- used to fuel the crop-preview PNG and
+    to skip the redundant scan inside the subsequent test-mode sweep."""
+    f = fnv.file.ImagerFile(str(ats_path))
+    f.unit = fnv.Unit.COUNTS
+    n = int(f.num_frames)
+    H, W = int(f.height), int(f.width)
+    best_idx, best_mean = -1, -1.0
+    best_frame: np.ndarray | None = None
+    report_step = max(1, n // 5)
+    for i in range(n):
+        f.get_frame(i)
+        page = np.asarray(f.final, dtype=np.uint16).reshape((H, W))
+        m = float(page.mean())
+        if m > best_mean:
+            best_mean = m
+            best_idx = i
+            best_frame = page.copy()
+        if (i + 1) % report_step == 0 or (i + 1) == n:
+            print(f"    scan {i + 1}/{n}", flush=True)
+    if best_frame is None:
+        raise RuntimeError(f"no frames in {ats_path}")
+    return best_idx, best_frame
+
+
 # ---------- JSON helpers ---------------------------------------------------
 def _jsonable(x):
     if x is None or isinstance(x, (bool, int, float, str)):
@@ -352,18 +568,38 @@ def convert_one(ats_path: Path, out_dir: Path,
                 *, unit: str = "celsius",
                 overrides: dict[str, float] | None = None,
                 overwrite: bool = False,
-                stem_suffix: str = "") -> dict:
-    """Convert one .ats into _temp_{C|K}.tif + _meta.json + _preview.png.
+                stem_suffix: str = "",
+                crop: tuple[int, int, int, int] | None = None,
+                flip_mode: str = "none") -> dict:
+    """Convert one .ats into _eps{E:.2f}_temp_{C|K}.tif + _meta.json + _preview.png.
 
     `stem_suffix` is appended to the output stem (used by test mode to
-    label files with the emissivity value they were generated with)."""
+    label files with the emissivity value they were generated with).
+    `crop` is a half-open `(x0, x1, y0, y1)` over the PRE-FLIP frame;
+    `flip_mode` is one of `FLIP_MODES` and is applied AFTER the crop."""
     if unit not in ("celsius", "kelvin"):
         raise ValueError(f"unit must be 'celsius' or 'kelvin', got {unit!r}")
     unit_suffix = "C" if unit == "celsius" else "K"
     unit_label  = "celsius" if unit == "celsius" else "kelvin"
 
     out_dir.mkdir(parents=True, exist_ok=True)
-    stem      = ats_path.stem + stem_suffix
+
+    # Open early so we know each file's recorded emissivity before we
+    # build the output paths: the filename now records the actually-used
+    # emissivity (per-file recorded value, or the override if any).
+    t0 = time.time()
+    f = fnv.file.ImagerFile(str(ats_path))
+
+    recorded = read_object_params(f)
+    eps_recorded = float(recorded.get("emissivity", 1.0))
+    sdk_can_change = bool(getattr(f, "can_change_object_parameters", False))
+
+    eps_used = (float(overrides["emissivity"])
+                if overrides and "emissivity" in overrides
+                else eps_recorded)
+    eps_tag = f"_eps{eps_used:.2f}"
+
+    stem      = ats_path.stem + stem_suffix + eps_tag
     out_tif   = out_dir / f"{stem}_temp_{unit_suffix}.tif"
     out_json  = out_dir / f"{stem}_meta.json"
     out_png   = out_dir / f"{stem}_preview.png"
@@ -372,15 +608,6 @@ def convert_one(ats_path: Path, out_dir: Path,
         and out_tif.exists() and out_json.exists() and out_png.exists()):
         return {"status": "skipped",
                 "tif_gb": out_tif.stat().st_size / 1e9}
-
-    t0 = time.time()
-    f = fnv.file.ImagerFile(str(ats_path))
-
-    # Snapshot the recorded object_parameters before any override, so the
-    # JSON can show both what was in the .ats and what we actually used.
-    recorded = read_object_params(f)
-    eps_recorded = float(recorded.get("emissivity", 1.0))
-    sdk_can_change = bool(getattr(f, "can_change_object_parameters", False))
 
     # Apply user-supplied object-parameter overrides BEFORE switching
     # to a temperature unit.  If the SDK accepts live changes the new
@@ -406,11 +633,26 @@ def convert_one(ats_path: Path, out_dir: Path,
     n = int(f.num_frames)
     H, W = int(f.height), int(f.width)
 
+    # Probe the post-crop+flip shape on a dummy frame so the progress
+    # line and the meta JSON record the actual stored size.
+    dummy = np.zeros((H, W), dtype=np.float32)
+    try:
+        sample_out = apply_flip(apply_crop(dummy, crop), flip_mode)
+    except ValueError as exc:
+        raise RuntimeError(
+            f"crop {crop} does not fit this file's {H}x{W} frame: {exc}"
+        ) from exc
+    Hout, Wout = sample_out.shape[:2]
+
     print(f"  camera = {f.source_info.camera}  "
           f"serial = {f.source_info.camera_serial}", flush=True)
     print(f"  {n} frames @ {f.source_info.preset_info[0].frame_rate:.1f} fps  "
-          f"{H}x{W}  payload (float32) ~ {n*H*W*4/1e9:.2f} GB", flush=True)
-    print(f"  writing temperature in {unit_label}", flush=True)
+          f"src {H}x{W} -> out {Hout}x{Wout}  "
+          f"crop={crop}  flip={flip_mode}", flush=True)
+    print(f"  emissivity used = {eps_used:.4f}  "
+          f"(recorded {eps_recorded:.4f})", flush=True)
+    print(f"  payload (float32) ~ {n*Hout*Wout*4/1e9:.2f} GB  "
+          f"writing temperature in {unit_label}", flush=True)
 
     # ---- Track the hottest frame (max mean temperature) -----------------
     best_mean: float = -float("inf")
@@ -431,6 +673,7 @@ def convert_one(ats_path: Path, out_dir: Path,
                     lambda_eff_um=DEFAULT_LAMBDA_EFF_UM,
                 )
             page = page_K + offset
+            page = apply_flip(apply_crop(page, crop), flip_mode)
             tw.write(
                 page, photometric="minisblack",
                 compression="zlib", compressionargs={"level": ZLIB_LEVEL},
@@ -452,8 +695,9 @@ def convert_one(ats_path: Path, out_dir: Path,
     if best_frame is None:
         idx = FALLBACK_PREVIEW_FRAME if n > FALLBACK_PREVIEW_FRAME else n // 2
         f.get_frame(idx)
-        best_frame = (np.asarray(f.final, dtype=np.float32)
-                      .reshape((H, W)) + offset)
+        raw_K = (np.asarray(f.final, dtype=np.float32).reshape((H, W)))
+        fallback = apply_flip(apply_crop(raw_K + offset, crop), flip_mode)
+        best_frame = fallback
         best_idx, best_mean = idx, float(best_frame.mean())
 
     # ---- Preview PNG (1-99 % percentile stretch to 8-bit) ---------------
@@ -470,6 +714,14 @@ def convert_one(ats_path: Path, out_dir: Path,
         applied_overrides=overrides or {},
     )
     meta["source_file"] = str(ats_path)
+    meta["emissivity_used"] = float(eps_used)
+    meta["source_height"] = int(H)
+    meta["source_width"]  = int(W)
+    meta["output_height"] = int(Hout)
+    meta["output_width"]  = int(Wout)
+    meta["crop_x0_x1_y0_y1_zero_based_half_open"] = (
+        list(crop) if crop is not None else None)
+    meta["flip_mode_after_crop"] = flip_mode
     out_json.write_text(json.dumps(meta, indent=2, default=str))
 
     return {
@@ -814,14 +1066,20 @@ def find_hottest_frame(ats_path: Path) -> tuple[int, float]:
 def test_sweep_one_file(ats_path: Path, out_dir: Path,
                         emissivities: list[float], *,
                         unit: str = "celsius",
-                        overwrite: bool = False) -> dict:
+                        overwrite: bool = False,
+                        crop: tuple[int, int, int, int] | None = None,
+                        flip_mode: str = "none",
+                        hottest_idx: int | None = None) -> dict:
     """For ONE .ats file:
-      1.  Find the hottest frame (mean ADC count) -- one pass over the stack.
-      2.  For each test emissivity, re-decode just that frame in
-          Unit.TEMPERATURE_FACTORY with object_parameters.emissivity
-          overridden, and append it (plus a label strip showing
-          "emissivity = X.XXX" in white at the bottom edge) as one page
-          of a single multi-page float32 TIFF.
+      1.  Find the hottest frame (mean ADC count) -- one pass over the
+          stack -- unless `hottest_idx` was supplied by an earlier scan.
+      2.  Read that single frame once in Unit.TEMPERATURE_FACTORY.
+      3.  For each test emissivity, Wien-post-correct the frame in
+          Python, apply the user-chosen crop and flip, then prepend a
+          dark label strip with "emissivity = X.XXX" in white at the
+          TOP of the page (so the burnt-in label never occludes pixels).
+      4.  Stack the resulting pages into a single multi-page float32
+          TIFF.
 
     Output (next to each other):
         <stem>_eps_sweep_temp_{C|K}.tif      one page per emissivity
@@ -838,8 +1096,14 @@ def test_sweep_one_file(ats_path: Path, out_dir: Path,
 
     t0 = time.time()
 
-    print(f"  scanning for hottest frame in {ats_path.name} ...", flush=True)
-    best_idx, best_mean_count = find_hottest_frame(ats_path)
+    if hottest_idx is None:
+        print(f"  scanning for hottest frame in {ats_path.name} ...",
+              flush=True)
+        best_idx, best_mean_count = find_hottest_frame(ats_path)
+    else:
+        best_idx, best_mean_count = int(hottest_idx), float("nan")
+        print(f"  using pre-scanned hottest frame index = {best_idx}",
+              flush=True)
     print(f"  hottest frame index = {best_idx}  "
           f"(mean ADC = {best_mean_count:.1f})", flush=True)
 
@@ -863,7 +1127,8 @@ def test_sweep_one_file(ats_path: Path, out_dir: Path,
 
     pages, page_stats = [], []
     unit_sym = "deg C" if unit == "celsius" else "K"
-    print(f"  building {len(emissivities)} emissivity page(s) ...", flush=True)
+    print(f"  building {len(emissivities)} emissivity page(s) "
+          f"(crop={crop}, flip={flip_mode}) ...", flush=True)
     for j, eps in enumerate(emissivities, 1):
         if abs(eps - eps_recorded) < 1e-9:
             T_new_K = T_recorded_K
@@ -875,6 +1140,10 @@ def test_sweep_one_file(ats_path: Path, out_dir: Path,
         page = (T_new_K
                 - (KELVIN_OFFSET if unit == "celsius" else 0.0)
                 ).astype(np.float32)
+        # Crop first, then flip: same order the batch path uses, so the
+        # frame the user sees in Fiji matches what batch-mode TIFFs will
+        # look like for the same camera and the same chosen settings.
+        page = apply_flip(apply_crop(page, crop), flip_mode)
         pages.append(page)
         page_stats.append({
             "page_index": j - 1,
@@ -896,14 +1165,19 @@ def test_sweep_one_file(ats_path: Path, out_dir: Path,
     bg_val = gmin - 0.05 * span - 1.0
     fg_val = gmax + 0.05 * span + 1.0
     strip_h = 28
+    out_H, out_W = pages[0].shape[:2]
 
     print(f"  writing {out_tif.name}  "
-          f"({len(pages)} pages, {H+strip_h}x{W} float32) ...", flush=True)
+          f"({len(pages)} pages, {strip_h + out_H}x{out_W} float32, "
+          f"label on top) ...", flush=True)
     with tifffile.TiffWriter(str(out_tif), bigtiff=False) as tw:
         for page, eps in zip(pages, emissivities):
             label = f"emissivity = {eps:.3f}"
-            strip = render_label_strip(label, W, strip_h, bg_val, fg_val)
-            page_with_label = np.concatenate([page, strip], axis=0)
+            strip = render_label_strip(label, out_W, strip_h,
+                                       bg_val, fg_val)
+            # Label strip goes ABOVE the picture so the burnt-in text
+            # never occludes any pixel of the real scene.
+            page_with_label = np.concatenate([strip, page], axis=0)
             tw.write(
                 page_with_label, photometric="minisblack",
                 compression="zlib", compressionargs={"level": ZLIB_LEVEL},
@@ -919,9 +1193,15 @@ def test_sweep_one_file(ats_path: Path, out_dir: Path,
         "test_emissivity_values": [float(e) for e in emissivities],
         "pixel_unit_written": "celsius" if unit == "celsius" else "kelvin",
         "data_type_in_tiff": "float32",
-        "scene_height": int(H),
-        "scene_width":  int(W),
+        "source_height": int(H),
+        "source_width":  int(W),
+        "output_height_per_page": int(out_H),
+        "output_width_per_page":  int(out_W),
+        "crop_x0_x1_y0_y1_zero_based_half_open": (
+            list(crop) if crop is not None else None),
+        "flip_mode_after_crop": flip_mode,
         "label_strip_height": int(strip_h),
+        "label_strip_position": "top",
         "label_strip_bg_value": float(bg_val),
         "label_strip_fg_value": float(fg_val),
         "tiff_layout": (
@@ -929,11 +1209,12 @@ def test_sweep_one_file(ats_path: Path, out_dir: Path,
             "source .ats, originally decoded in Unit.TEMPERATURE_FACTORY "
             f"with the recorded emissivity {eps_recorded:.4f}, then "
             "Wien-post-corrected in Python to the emissivity in "
-            "test_emissivity_values[page]. All other object_parameters "
-            f"were left at their recorded values.  A {strip_h}-row label "
-            "strip is appended at the bottom of every page (white text "
-            "'emissivity = X.XXX' on a dark background).  The real scene "
-            f"area is the top {H} rows."
+            f"test_emissivity_values[page], cropped to {crop} and flipped "
+            f"({flip_mode}). All other object_parameters were left at "
+            f"their recorded values.  A {strip_h}-row label strip is "
+            "PREPENDED at the top of every page (white text 'emissivity "
+            "= X.XXX' on a dark background); the real scene area is the "
+            f"bottom {out_H} rows."
         ),
         "emissivity_correction": {
             "method": "Wien high-T approximation",
@@ -1069,15 +1350,43 @@ def test_mode(args, input_dir: Path, output_dir: Path,
         state["emissivity_spec"] = eps_spec
         save_state(state)
 
+        # One scan to find the hottest frame -- its data drives the crop
+        # preview AND is fed straight into the sweep, so we never scan
+        # the same file twice in a single round.
+        print(f"\n[test] scanning {ats.name} for the hottest frame "
+              f"(crop-preview source) ...", flush=True)
+        try:
+            hottest_idx, hot_frame = _read_hottest_frame_counts(ats)
+        except Exception as exc:
+            print(f"  !!! could not scan {ats.name}: {exc!r}", flush=True)
+            action = prompt_post_test_action()
+            if action == "test":
+                continue
+            return action
+
+        crop, crop_spec = prompt_crop_range(
+            hot_frame, output_dir,
+            default_spec=state.get("crop_spec") or None)
+        state["crop_spec"] = crop_spec
+        save_state(state)
+
+        flip_mode = prompt_flip_mode(default=state.get("flip_mode"))
+        state["flip_mode"] = flip_mode
+        save_state(state)
+
         print(f"\n[test] sweep on {ats.name} with "
-              f"{len(eps_list)} emissivity value(s)", flush=True)
+              f"{len(eps_list)} emissivity value(s), "
+              f"crop={crop}, flip={flip_mode}", flush=True)
         try:
             # Test mode always overwrites: users iterate parameter choices
             # and expect the latest values to land on disk, not a stale
             # output from an earlier round to be silently kept.
             r = test_sweep_one_file(ats, output_dir, eps_list,
                                     unit=args.unit,
-                                    overwrite=True)
+                                    overwrite=True,
+                                    crop=crop,
+                                    flip_mode=flip_mode,
+                                    hottest_idx=hottest_idx)
             print(f"  -> {r['status']}  "
                   f"({r.get('n_pages', 0)} pages, "
                   f"{r.get('tif_mb', 0):.2f} MB, "
@@ -1166,6 +1475,31 @@ def batch_mode(args, input_dir: Path, output_dir: Path,
                 print("\n[batch] no overrides -- using each file's recorded "
                       "values verbatim")
 
+    # ---- Crop + flip prompts (shared across the batch) ----------------
+    crop: tuple[int, int, int, int] | None = None
+    flip_mode = state.get("flip_mode") or DEFAULT_FLIP_MODE
+    if args.no_confirm:
+        print(f"[batch] --no-confirm: no crop, flip={flip_mode} "
+              f"(remembered default)")
+    else:
+        print(f"\n[batch] scanning {ats_files[0].name} for the hottest "
+              f"frame (crop-preview source) ...")
+        try:
+            _, hot_frame = _read_hottest_frame_counts(ats_files[0])
+            crop, crop_spec = prompt_crop_range(
+                hot_frame, output_dir,
+                default_spec=state.get("crop_spec") or None)
+            state["crop_spec"] = crop_spec
+            save_state(state)
+        except Exception as exc:
+            print(f"  [warn] crop-preview scan failed: {exc!r}; "
+                  "falling back to no crop")
+            crop = None
+
+        flip_mode = prompt_flip_mode(default=state.get("flip_mode"))
+        state["flip_mode"] = flip_mode
+        save_state(state)
+
     print()
     results = []
     batch_t0 = time.time()
@@ -1176,7 +1510,9 @@ def batch_mode(args, input_dir: Path, output_dir: Path,
         try:
             r = convert_one(ats, output_dir, unit=args.unit,
                             overrides=overrides if overrides else None,
-                            overwrite=args.overwrite)
+                            overwrite=args.overwrite,
+                            crop=crop,
+                            flip_mode=flip_mode)
             r["path"] = str(ats)
             print(f"  -> {r['status']}", flush=True)
             results.append(r)
@@ -1232,7 +1568,8 @@ def main():
     if state:
         print(f"[state] remembered defaults from {STATE_FILE}")
         for k in ("mode", "input_dir", "output_dir", "file_selection",
-                  "test_file_name", "emissivity_spec"):
+                  "test_file_name", "emissivity_spec",
+                  "crop_spec", "flip_mode"):
             if k in state:
                 print(f"          {k:<16} = {state[k]}")
         if state.get("object_overrides"):
