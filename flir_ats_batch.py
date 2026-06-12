@@ -45,8 +45,20 @@ Usage:
         (re-encode files whose outputs already exist; default skips them)
 
     python flir_ats_batch.py --no-confirm
-        (skip the interactive radiometric-parameter inspection / override
-        prompt; just use the values recorded inside each .ats verbatim)
+        (skip both the interactive file-selection prompt and the
+        radiometric-parameter inspection / override prompt; just process
+        every file found, with the values recorded inside each .ats
+        verbatim)
+
+    python flir_ats_batch.py --files "1-10"
+        (process only files 1 through 10 from the sorted .ats listing;
+        also accepts e.g. "1 3 5", "1,3,5", or "1-5 10 15-20")
+
+File-selection prompt (default behaviour):
+    After finding the .ats files under --input the script prints a
+    numbered listing (1-based) and asks you to enter "all" / a range /
+    a list of individual indices / or a mix.  See --files above for the
+    exact syntax.
 
 Object-parameter inspection (default behaviour):
     Before the batch starts the script opens the FIRST .ats file in the
@@ -385,6 +397,84 @@ def convert_one(ats_path: Path, out_dir: Path,
     }
 
 
+# ---------- File-selection helpers ----------------------------------------
+def parse_file_selection(raw: str, n_total: int) -> list[int]:
+    """Parse '', 'all', '1-10', '1 3 5', '1,3,5', '1-5 10 15-20' (or any
+    combination) into a sorted, deduped, 1-based list of indices clipped
+    to [1, n_total].  Empty string or 'all' (case-insensitive) -> every
+    index 1..n_total.  Raises ValueError on garbage tokens."""
+    raw = raw.strip().lower()
+    if not raw or raw == "all":
+        return list(range(1, n_total + 1))
+    selected: set[int] = set()
+    for tok in raw.replace(",", " ").split():
+        if "-" in tok:
+            lo_s, hi_s = tok.split("-", 1)
+            try:
+                lo_i, hi_i = int(lo_s), int(hi_s)
+            except ValueError as exc:
+                raise ValueError(f"invalid range {tok!r}") from exc
+            if lo_i > hi_i:
+                lo_i, hi_i = hi_i, lo_i
+            for i in range(lo_i, hi_i + 1):
+                if 1 <= i <= n_total:
+                    selected.add(i)
+        else:
+            try:
+                i = int(tok)
+            except ValueError as exc:
+                raise ValueError(f"not a number {tok!r}") from exc
+            if 1 <= i <= n_total:
+                selected.add(i)
+    return sorted(selected)
+
+
+def _display_name(p: Path, input_dir: Path) -> str:
+    try:
+        return str(p.relative_to(input_dir))
+    except ValueError:
+        return p.name
+
+
+def prompt_file_selection(ats_files: list[Path],
+                          input_dir: Path) -> list[Path]:
+    """List the .ats files with 1-based indices and let the user pick a
+    subset.  Re-prompts on invalid input or rejected confirmation."""
+    n = len(ats_files)
+    width = len(str(n))
+    while True:
+        print(f"\nFound {n} .ats files under {input_dir}:")
+        for i, p in enumerate(ats_files, 1):
+            sz_gb = p.stat().st_size / 1e9
+            print(f"  {i:>{width}}  {_display_name(p, input_dir):<40s}  "
+                  f"({sz_gb:5.2f} GB)")
+        print("\nWhich files do you want to convert?")
+        print("  press Enter (or 'all') -> every file")
+        print("  '1-10'                 -> a range (inclusive)")
+        print("  '1 3 5' or '1,3,5'     -> individual files")
+        print("  '1-5 10 15-20'         -> mix of ranges and individuals")
+        raw = input("Selection: ").strip()
+        try:
+            idxs = parse_file_selection(raw, n)
+        except ValueError as exc:
+            print(f"  invalid selection: {exc}, try again")
+            continue
+        if not idxs:
+            print("  no files selected, try again")
+            continue
+        picked = [ats_files[i - 1] for i in idxs]
+        print(f"\n  Selected {len(picked)} of {n} file(s):")
+        for p in picked:
+            print(f"    - {_display_name(p, input_dir)}")
+        ans = input("Proceed with this selection? [y/N/edit]: "
+                    ).strip().lower()
+        if ans in ("y", "yes"):
+            return picked
+        if ans in ("e", "edit"):
+            continue
+        print("  cancelled, re-listing")
+
+
 # ---------- Batch driver --------------------------------------------------
 def _prompt_dir(prompt: str) -> Path | None:
     raw = input(prompt).strip().strip('"').strip("'")
@@ -405,8 +495,14 @@ def main():
                     help="Re-convert files whose outputs already exist")
     ap.add_argument("--no-confirm", action="store_true",
                     help="Skip the interactive object-parameter "
-                         "inspection/override prompt; use the values "
-                         "recorded inside each .ats verbatim")
+                         "inspection/override prompt AND the file-selection "
+                         "prompt; use the values recorded inside each .ats "
+                         "verbatim and process every file found")
+    ap.add_argument("--files", type=str, default=None,
+                    help="Non-interactive file selection.  Same syntax as the "
+                         "interactive prompt: 'all', '1-10', '1 3 5', "
+                         "'1-5 10 15-20'.  1-based indices into the sorted "
+                         "list of .ats files under --input.")
     args = ap.parse_args()
 
     if args.input is None:
@@ -423,16 +519,34 @@ def main():
     args.output.mkdir(parents=True, exist_ok=True)
 
     pattern = args.input.glob if args.no_recurse else args.input.rglob
-    ats_files = sorted(pattern("*.ats"))
-    if not ats_files:
+    all_ats_files = sorted(pattern("*.ats"))
+    if not all_ats_files:
         print(f"No .ats files found under {args.input}")
         sys.exit(0)
+
+    # ---- Pick a subset of files to process ------------------------------
+    if args.files is not None:
+        try:
+            idxs = parse_file_selection(args.files, len(all_ats_files))
+        except ValueError as exc:
+            print(f"ERROR: --files {args.files!r}: {exc}", file=sys.stderr)
+            sys.exit(1)
+        if not idxs:
+            print(f"ERROR: --files {args.files!r} matched no files",
+                  file=sys.stderr)
+            sys.exit(1)
+        ats_files = [all_ats_files[i - 1] for i in idxs]
+    elif args.no_confirm:
+        ats_files = all_ats_files
+    else:
+        ats_files = prompt_file_selection(all_ats_files, args.input)
 
     print()
     print(f"[setup] FLIR SDK loaded: {fnv.__file__}")
     print(f"[setup] input:  {args.input}")
     print(f"[setup] output: {args.output}")
-    print(f"[setup] {len(ats_files)} .ats files to convert  "
+    print(f"[setup] {len(ats_files)} of {len(all_ats_files)} .ats files "
+          f"selected for conversion  "
           f"(unit={args.unit}, "
           f"{'overwrite' if args.overwrite else 'skip existing'})")
 

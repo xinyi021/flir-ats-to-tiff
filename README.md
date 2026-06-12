@@ -100,9 +100,37 @@ Useful flags:
 --unit kelvin       write Kelvin into the TIFF instead of the default Celsius
 --no-recurse        only scan the top level of --input (default scans subfolders)
 --overwrite         re-convert files whose outputs already exist
---no-confirm        skip the interactive radiometric-parameter prompt and just
-                    use the values recorded inside each .ats verbatim
+--no-confirm        skip both interactive prompts (file selection AND radiometric
+                    parameter override) and process every file with the values
+                    recorded inside each .ats verbatim
+--files "1-10"      non-interactive subset selection (same syntax as the
+                    interactive prompt; see below)
 ```
+
+### File-selection prompt (default)
+
+After finding the `.ats` files under `--input` the script lists them
+with 1-based indices and prompts you to pick which ones to process:
+
+```
+Found 31 .ats files under D:\Recordings\modulated:
+   1  Rec-000548.ats                            ( 3.49 GB)
+   2  Rec-000549.ats                            ( 3.52 GB)
+   3  Rec-000550.ats                            ( 3.45 GB)
+  ...
+  31  Rec-000578.ats                            ( 3.49 GB)
+
+Which files do you want to convert?
+  press Enter (or 'all') -> every file
+  '1-10'                 -> a range (inclusive)
+  '1 3 5' or '1,3,5'     -> individual files
+  '1-5 10 15-20'         -> mix of ranges and individuals
+Selection:
+```
+
+The chosen subset is summarised back, you confirm with `y`, and the
+batch begins. To skip the prompt entirely pass `--files "1-10"` (or
+`--files all`) on the command line.
 
 ### Radiometric parameter inspection (default)
 
