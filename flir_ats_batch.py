@@ -610,23 +610,54 @@ def convert_one(ats_path: Path, out_dir: Path,
                 "tif_gb": out_tif.stat().st_size / 1e9}
 
     # Apply user-supplied object-parameter overrides BEFORE switching
-    # to a temperature unit.  If the SDK accepts live changes the new
-    # values flow through its own radiometric path.  If not, we keep
-    # the SDK output at the recorded emissivity and apply an exact
-    # single-wavelength Planck post-correction in Python (for the
-    # emissivity override only; other parameter overrides are silently
-    # ignored when the SDK refuses them).
+    # to a temperature unit.  Two cases:
+    #
+    #  - If the SDK actually honours live object_parameter edits, the
+    #    new values flow through its own band-integrated radiometric
+    #    inversion -- nothing else to do, leave eps_override = None.
+    #
+    #  - If the SDK silently ignores the setattr (some science-camera
+    #    ATS files do this even though they advertise
+    #    can_change_object_parameters = True), we have to post-correct
+    #    in Python with the exact single-wavelength Planck inversion.
+    #    Other-parameter overrides cannot be recovered this way and
+    #    are reported as ignored.
+    #
+    # We don't trust the advertised flag -- we probe.  The probe uses
+    # frame 0 (cheap, and only used to detect SDK responsiveness; the
+    # actual per-frame conversion still walks every frame below).
     eps_override = None
     if overrides:
         apply_overrides(f, overrides)
-        if (not sdk_can_change) and "emissivity" in overrides \
+        if "emissivity" in overrides \
                 and abs(float(overrides["emissivity"]) - eps_recorded) > 1e-9:
-            eps_override = float(overrides["emissivity"])
-            print(f"  [info] SDK refuses live object_parameters edits on "
-                  f"this file -- using exact-Planck post-correction "
-                  f"(lambda_eff = {DEFAULT_LAMBDA_EFF_UM} um) to retarget "
-                  f"emissivity {eps_recorded:.4f} -> {eps_override:.4f}",
-                  flush=True)
+            f.unit = fnv.Unit.TEMPERATURE_FACTORY
+            sdk_responds, probe_delta = sdk_emissivity_actually_responds(
+                f, best_idx=0, eps_recorded=eps_recorded,
+                H=int(f.height), W=int(f.width),
+            )
+            if not sdk_responds:
+                eps_override = float(overrides["emissivity"])
+                print(f"  [info] SDK setattr on object_parameters.emissivity "
+                      f"produced only {probe_delta:.3g} K change on the "
+                      f"probe frame "
+                      f"(claimed can_change={sdk_can_change}) -- "
+                      f"falling back to exact-Planck post-correction "
+                      f"(lambda_eff = {DEFAULT_LAMBDA_EFF_UM} um) to "
+                      f"retarget emissivity {eps_recorded:.4f} -> "
+                      f"{eps_override:.4f}",
+                      flush=True)
+                # Restore the recorded eps so the SDK keeps decoding at
+                # its baseline -- the Wien/Planck post-correction
+                # handles the retargeting.
+                try:
+                    f.object_parameters.emissivity = float(eps_recorded)
+                except Exception:
+                    pass
+            # Re-apply any *other* overrides; restoring eps above may
+            # have wiped them out on some SDK builds.
+            apply_overrides(f, {k: v for k, v in overrides.items()
+                                if k != "emissivity"})
 
     f.unit = fnv.Unit.TEMPERATURE_FACTORY
 
@@ -1038,6 +1069,61 @@ def emissivity_correct_kelvin(T_kelvin: np.ndarray,
     return T_new.astype(np.float32)
 
 
+SDK_NATIVE_PROBE_TOLERANCE_K = 0.5
+
+
+def sdk_emissivity_actually_responds(f, *, best_idx: int,
+                                     eps_recorded: float,
+                                     H: int, W: int) -> tuple[bool, float]:
+    """Detect whether writing to `f.object_parameters.emissivity` and
+    re-reading the frame actually produces a different decoded
+    temperature -- regardless of what `f.can_change_object_parameters`
+    advertises.
+
+    Many science-camera ATS files (X6900sc, A6750sc, ...) report
+    `can_change_object_parameters = True` *and* silently no-op the
+    setattr, so the only reliable test is empirical: write a sharply
+    different emissivity, re-decode the same frame, and check whether
+    the per-pixel temperature actually moved.
+
+    Returns `(responds, max_delta_kelvin)`.  `responds = True` iff the
+    probe Δ is larger than `SDK_NATIVE_PROBE_TOLERANCE_K` (0.5 K).  The
+    emissivity is restored to `eps_recorded` and the cached frame
+    decode is left in the recorded-emissivity state."""
+    # Baseline at recorded eps.
+    f.get_frame(best_idx)
+    T_baseline = (np.asarray(f.final, dtype=np.float32)
+                  .reshape((H, W)).copy())
+
+    # Pick a probe eps at the opposite end of the (0, 1) range so the
+    # decoded temperature MUST change by a large margin if the SDK
+    # honours the edit.
+    probe_eps = 0.10 if eps_recorded > 0.5 else 0.95
+
+    delta = 0.0
+    try:
+        f.object_parameters.emissivity = float(probe_eps)
+        f.get_frame(best_idx)
+        T_probe = (np.asarray(f.final, dtype=np.float32)
+                   .reshape((H, W)))
+        delta = float(np.abs(T_probe - T_baseline).max())
+    except Exception as exc:
+        # If the setattr itself raised, the SDK definitely refuses.
+        print(f"  [probe] setattr / re-read raised "
+              f"{type(exc).__name__}: {exc!r}", flush=True)
+        delta = 0.0
+    finally:
+        # Restore recorded eps and re-decode so callers see a clean
+        # recorded-eps frame in the cached buffer.
+        try:
+            f.object_parameters.emissivity = float(eps_recorded)
+        except Exception:
+            pass
+        f.get_frame(best_idx)
+
+    return (delta > SDK_NATIVE_PROBE_TOLERANCE_K, delta)
+
+
 # ---------- Test-mode helpers (single-frame multi-emissivity stack) -------
 def _find_font(size: int):
     """Best-effort TrueType font; fall back to PIL's tiny bitmap."""
@@ -1174,24 +1260,41 @@ def test_sweep_one_file(ats_path: Path, out_dir: Path,
     f.get_frame(best_idx)
     H, W = int(f.height), int(f.width)
     eps_recorded = float(f.object_parameters.emissivity)
-    sdk_can_change = bool(f.can_change_object_parameters)
-    print(f"  recorded emissivity in .ats = {eps_recorded:.4f}  "
-          f"(SDK can_change_object_parameters = {sdk_can_change})", flush=True)
+    sdk_can_change_claimed = bool(f.can_change_object_parameters)
 
-    if sdk_can_change:
+    # Trust nothing -- empirically probe whether setting a new
+    # emissivity actually moves the decoded frame.  Some science-camera
+    # ATS files (X6900sc, A6750sc, ...) advertise can_change=True yet
+    # silently no-op the setattr.
+    print(f"  recorded emissivity in .ats = {eps_recorded:.4f}  "
+          f"(SDK can_change_object_parameters = {sdk_can_change_claimed})",
+          flush=True)
+    sdk_responds, probe_delta = sdk_emissivity_actually_responds(
+        f, best_idx=best_idx, eps_recorded=eps_recorded, H=H, W=W
+    ) if sdk_can_change_claimed else (False, 0.0)
+    T_recorded_K = np.asarray(f.final, dtype=np.float32).reshape((H, W))
+
+    if sdk_responds:
         correction_method = "sdk_native"
-        # We do NOT need to cache T_recorded_K -- each page re-reads
-        # the frame after setting a different emissivity.
-        T_recorded_K = np.asarray(f.final, dtype=np.float32).reshape((H, W))
-        print(f"  SDK accepts live emissivity edits -- using the camera's "
-              f"band-integrated radiometric inversion (no single-wavelength "
-              f"approximation, no lambda_eff guess)", flush=True)
+        print(f"  probe: setting eps to a sharply different value moved "
+              f"the decoded frame by {probe_delta:.1f} K -- SDK live "
+              f"edits work.  Using the camera's band-integrated "
+              f"radiometric inversion (no single-wavelength "
+              f"approximation, no lambda_eff guess).", flush=True)
     else:
         correction_method = EMISSIVITY_CORRECTION_METHOD
-        T_recorded_K = np.asarray(f.final, dtype=np.float32).reshape((H, W))
-        print(f"  SDK does not allow live emissivity changes for this file "
-              f"-- using exact-Planck post-correction at lambda_eff = "
-              f"{DEFAULT_LAMBDA_EFF_UM} um", flush=True)
+        if sdk_can_change_claimed:
+            print(f"  probe: setting eps to a sharply different value moved "
+                  f"the decoded frame by only {probe_delta:.3g} K "
+                  f"(< {SDK_NATIVE_PROBE_TOLERANCE_K} K threshold) -- "
+                  f"the SDK ADVERTISES can_change=True but is silently "
+                  f"ignoring the setattr.  Falling back to exact-Planck "
+                  f"post-correction at lambda_eff = "
+                  f"{DEFAULT_LAMBDA_EFF_UM} um.", flush=True)
+        else:
+            print(f"  SDK does not allow live emissivity changes for "
+                  f"this file -- using exact-Planck post-correction at "
+                  f"lambda_eff = {DEFAULT_LAMBDA_EFF_UM} um", flush=True)
 
     pages, page_stats = [], []
     unit_sym = "deg C" if unit == "celsius" else "K"
