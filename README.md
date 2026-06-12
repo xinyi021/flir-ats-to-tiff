@@ -29,6 +29,33 @@ shift). The raw 14-bit ADC counts remain recoverable at any time by
 reopening the source `.ats` with `f.unit = fnv.Unit.COUNTS`; this tool
 never modifies the source files.
 
+## Quick start
+
+```powershell
+# 0. one-off setup (per machine)
+msiexec /i installers\FLIRScienceFileSDK-2026.1.2+10-Windows-x64.msi
+pip install "<wheel matching your python>"   # see "Install" below
+pip install numpy tifffile pillow
+
+# 1. run interactively (recommended)
+python flir_ats_batch.py
+#  -> answer the prompts:
+#       test/batch  -> batch
+#       input dir   -> D:\Recordings\modulated
+#       output dir  -> E:\converted\modulated
+#       file select -> Enter (= all) or '1-10'
+#       overrides   -> Enter (= use recorded object_parameters)
+#       crop        -> Enter (= no crop) or '100-540 50-460'
+#       flip        -> Enter (= rot180, the X6900sc default)
+
+# 2. read the output in Fiji or Python (see "How to read the output")
+```
+
+Every prompt remembers your answer; the next run can be driven entirely
+by pressing Enter.  See **Modes**, **Crop and flip**, and **Remembered
+defaults** below.  See **Temperature calculation and emissivity** for
+the physics and the per-step error budget.
+
 ## What you need to download
 
 1. **This repository.** Clone or download as a ZIP.
@@ -154,32 +181,27 @@ Test mode is deliberately frugal:
 
 #### About the Wien correction
 
-The FLIR Science File SDK 2026.1.2 reports
-`can_change_object_parameters = False` for ATS files written by many
-science cameras (including the X6900sc), and trying to set
-`f.unit = fnv.Unit.TEMPERATURE_USER` raises *"failed to set unit"*.
-The SDK therefore refuses to recompute temperature live under a
-different emissivity assumption -- assigning to
-`f.object_parameters.emissivity` looks like it succeeds but the SDK's
-TEMPERATURE_FACTORY output is unchanged.
-
-To still allow an emissivity-sensitivity study this tool does the
-inversion analytically in Python using the Wien high-T approximation,
+The FLIR Science File SDK 2026.1.2 will not recompute temperature
+under a different emissivity for X6900sc ATS files (it reports
+`can_change_object_parameters = False` and refuses
+`Unit.TEMPERATURE_USER`).  This tool does the re-targeting itself by
+analytically inverting the Wien high-T approximation of the Planck
+radiation law,
 
 ```
 1/T_new = 1/T_assumed  -  (lambda_eff / C2) * ln(eps_assumed / eps_new)
 ```
 
-with `C2 = 14388 micrometre * Kelvin`, the camera's recorded emissivity
-as `eps_assumed`, and `lambda_eff = 3.5 micrometre` as a sensible
-default for a mid-wave InSb camera with a 2-5 micrometre filter. The
-reflected-radiance term is omitted; this is accurate when scene
-temperatures are much larger than the reflected-environment
-temperature (the common high-T use case).
+with `C2 = 14388 µm·K`, `lambda_eff = 3.5 µm` (centre of the X6900sc's
+2-5 µm MWIR pass-band), and the source file's recorded emissivity as
+`eps_assumed`.  The reflected-radiance term is omitted (valid when
+scene `T` is much larger than reflected-environment `T`).  Each
+`*_eps_sweep_meta.json` records `lambda_eff`, `C2`, and `eps_assumed`,
+so the run is reproducible and can be re-derived without the SDK.
 
-The `*_eps_sweep_meta.json` records the assumption, the wavelength,
-and the recorded emissivity used as `eps_assumed`, so the run is
-reproducible and can be re-derived without the SDK.
+**See *Temperature calculation and emissivity* below for the full
+derivation, including a per-temperature table of Wien-vs-exact-Planck
+bias and recommendations on when the approximation is reliable.**
 
 ```
 Rec-000548_eps_sweep_temp_C.tif    one file, one page per emissivity
@@ -367,6 +389,185 @@ recompute temperatures under a different set of assumptions, reopen the
 source `.ats` through the SDK with adjusted `object_parameters` (the SDK
 exposes those as writeable attributes) and convert in
 `Unit.TEMPERATURE_USER`.
+
+## Temperature calculation and emissivity
+
+### 1. The full radiometric model
+
+Inside the `.ats` the camera stores a per-pixel 14-bit ADC count.  The
+temperature written into the TIFF is the result of the FLIR Science
+File SDK inverting the camera's factory radiometric model.  The model
+the SDK uses (the standard form for cooled mid-wave IR cameras) is
+
+```
+I_measured = ε · τ_atm · τ_optics · B(T_obj)            ← own emission
+           + (1 − ε) · τ_atm · τ_optics · B(T_refl)     ← reflected
+           + (1 − τ_atm) · τ_optics · B(T_atm)          ← path radiance
+           + (1 − τ_optics) · B(T_window)               ← external optics
+```
+
+where
+
+| Symbol | Meaning | `object_parameters` key |
+|---|---|---|
+| `ε` | surface emissivity | `emissivity` |
+| `τ_atm` | atmospheric transmission | `atmospheric_transmission` |
+| `τ_optics` | external optics transmission | `ext_optics_transmission` |
+| `T_refl` | reflected (background) temperature | `reflected_temp` |
+| `T_atm` | atmospheric temperature | `atmosphere_temp` |
+| `T_window` | external optics temperature | `ext_optics_temp` |
+| `B(T)` | Planck spectral radiance integrated over the camera's spectral response | (built into the factory calibration) |
+
+The SDK solves the equation for `T_obj` given the measured radiance
+and every other parameter.  The "Radiometric parameter inspection"
+prompt at the start of a batch run displays the recorded values and
+lets you override any of them.
+
+### 2. The factory Planck approximation
+
+`B(T)` is the spectral radiance integrated over the camera's filter
+band.  FLIR fits this with a closed-form expression (the so-called
+"Thermimage" approximation),
+
+```
+I_camera = R1 / ( R2 · (exp(B / T) − F) ) − O
+```
+
+with calibration constants `R1`, `R2`, `B`, `F`, `O` baked into the
+camera at the factory.  The SDK inverts this for `T`:
+
+```
+T = B / ln( R1 / ( R2 · (I + O) ) + F )
+```
+
+before adding the corrections for emissivity, reflected radiation, and
+atmospheric / optics losses.  This tool never sees the raw constants
+— the SDK applies them internally and returns calibrated Kelvin.
+
+### 3. Emissivity (and how this tool re-targets it)
+
+Emissivity multiplies the object's own thermal emission.  Two
+consequences:
+
+- **Lower assumed ε → higher reported T.**  For the same measured
+  radiance, the camera attributes the shortfall to the surface being
+  a less efficient emitter, so it must be hotter than initially assumed.
+- **Emissivity is the dominant uncertainty for hot, near-black-body
+  scenes.**  A 10 % change in ε produces a few percent shift in
+  reported T (often tens of °C at 1000 °C).
+
+The Science File SDK 2026.1.2 reports
+`can_change_object_parameters = False` for X6900sc ATS files and
+`Unit.TEMPERATURE_USER` raises *"failed to set unit"*; assigning to
+`f.object_parameters.emissivity` looks like it succeeds but the SDK's
+temperature output does not change.  To recover an emissivity-
+sensitivity capability this tool does the inversion analytically using
+the **Wien high-temperature approximation**
+
+```
+B(T) ∝ exp( − C2 / (λ_eff · T) )       with  C2 = 14388 µm·K
+```
+
+dropping the "− 1" in the denominator of the full Planck law.
+Equating radiances seen by the camera under two emissivity
+assumptions (and dropping the reflected term, see Section 4),
+
+```
+ε_assumed · B(T_assumed)  =  ε_new · B(T_new)
+```
+
+solves to
+
+```
+                 λ_eff
+1/T_new = 1/T_assumed − ─────── · ln( ε_assumed / ε_new )
+                  C2
+```
+
+with `T` in Kelvin.  This tool ships `λ_eff = 3.5 µm`, the centre of
+the X6900sc cold filter pass-band (2-5 µm, MWIR) with the ND 2.0
+filter installed; for other camera / filter combinations edit the
+`DEFAULT_LAMBDA_EFF_UM` constant at the top of `flir_ats_batch.py`.
+
+The same equation is applied in **batch mode** whenever an emissivity
+override is supplied for a locked file (so the TIFF's pixel values are
+already corrected) and in **test mode** when the user sweeps a list of
+emissivity values on the hottest frame.
+
+### 4. Uncertainty and known limitations
+
+Every temperature in the output TIFF carries error from several
+independent sources.  In rough order of importance for high-T (>700 °C)
+scenes recorded on the X6900sc:
+
+1. **Emissivity uncertainty (usually dominant).**  At T ≈ 1000 °C a
+   ±10 % change in assumed ε produces about ±50 °C of bias in the
+   reported T.  At 1500 °C the same ±10 % is roughly ±100 °C.  Use
+   test mode to bracket your scene's actual ε before committing to a
+   batch run.
+
+2. **Camera factory calibration.**  The X6900sc datasheet specifies an
+   absolute accuracy of ±1 °C or ±1 % of reading (whichever is
+   greater) over its calibrated range, plus an NETD < 20 mK
+   per-pixel (1-σ).  This is the irreducible noise floor on the SDK's
+   own output at the recorded object parameters.
+
+3. **Preset clamping.**  ATS files recorded on the 700-1500 °C preset
+   clamp pixels outside that window to 700 / 1500 °C exactly.  The
+   factory calibration is *undefined* outside the range, so histogram
+   "spikes" at those two values are saturation, not real pixel values.
+   To capture cooler regions, re-record on a lower-range preset.
+
+4. **Wien approximation error (test mode and emissivity-override
+   batch only).**  Dropping the "−1" in the Planck denominator
+   underestimates the denominator, so the Wien correction always
+   overestimates `T_new` (relative to the exact Planck inversion of the
+   same radiance equation).  Computed `T_new − T_exact` for the recorded
+   emissivity `ε_assumed = 0.92` at `λ_eff = 3.5 µm`:
+
+   | Recorded T | ε → 0.5 (1.8×) | ε → 0.3 (3.1×) | ε → 0.1 (9.2×) |
+   |---|---|---|---|
+   | 700 °C  | +4 °C  (+0.4 %) | +13 °C (+1.2 %)  | +110 °C (+6.6 %) |
+   | 1000 °C | +19 °C (+1.5 %) | +70 °C (+4.4 %)  | +887 °C (+30 %) |
+   | 1200 °C | +43 °C (+2.7 %) | +164 °C (+8.1 %) | unusable (Wien diverges) |
+   | 1500 °C | +107 °C (+5.3 %) | +460 °C (+17 %) | unusable (Wien diverges) |
+
+   Translation: Wien is reliable to a few percent of `T_new` for
+   **moderate** emissivity changes (factor ≤ ~2) across the camera's
+   full calibrated range; for **larger** emissivity ratios, the bias
+   grows rapidly with both `Δε` and `T_assumed`.  Recommended workflow:
+   use the test-mode sweep only to identify the right `ε` zone
+   (e.g. "the answer is somewhere in `ε ∈ [0.4, 0.7]`"), then narrow
+   the next sweep to that zone where the Wien error is acceptable.
+   Outside it, treat the numbers as order-of-magnitude only.
+
+5. **Reflected-radiance term omitted in the Wien correction.**  Valid
+   when `T_scene` is much larger than `T_refl`.  Concretely: for a
+   700 °C scene against a 20 °C room the reflected contribution is
+   below 10⁻¹⁵ of the scene's own emission and is wholly negligible.
+   For a 200 °C scene against a 100 °C oven it would be a several-
+   percent contributor and the Wien correction would have to be
+   extended.
+
+6. **Locked object-parameter overrides.**  When the SDK reports
+   `can_change_object_parameters = False`, overrides on every
+   parameter *other* than emissivity are silently ignored.  This tool
+   prints a `[info]` line when that happens and records both the
+   recorded value and the requested value in the JSON so the failure
+   is transparent.
+
+7. **Atmospheric / external-optics losses.**  Reasonable for the
+   sub-meter target distances used on this project; the recorded
+   `atmospheric_transmission = 0.97` corresponds to ~1 m of room air
+   in the MWIR band.  At metre-scale distances the contribution to
+   total uncertainty is well under 1 °C and is dwarfed by the
+   emissivity term.
+
+The `*_meta.json` next to every TIFF records, for full transparency:
+the recorded object parameters, the applied overrides, the emissivity
+used to compute the stored pixel values, the crop and flip applied
+afterwards, and (in test mode) the Wien correction parameters
+`λ_eff`, `C2`, and the source emissivity used as `ε_assumed`.
 
 ## How to read the output
 
