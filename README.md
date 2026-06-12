@@ -98,14 +98,58 @@ Useful flags:
 
 ```
 --unit kelvin       write Kelvin into the TIFF instead of the default Celsius
+--mode {test,batch} skip the start-up mode prompt and go straight to that mode
 --no-recurse        only scan the top level of --input (default scans subfolders)
 --overwrite         re-convert files whose outputs already exist
 --no-confirm        skip both interactive prompts (file selection AND radiometric
                     parameter override) and process every file with the values
-                    recorded inside each .ats verbatim
+                    recorded inside each .ats verbatim (implies batch mode)
 --files "1-10"      non-interactive subset selection (same syntax as the
-                    interactive prompt; see below)
+                    interactive prompt; implies batch mode)
 ```
+
+### Modes
+
+On start-up the script asks whether you want:
+
+```
+What would you like to do?
+  [1] Test mode  -- sweep emissivity values on ONE .ats file
+  [2] Batch mode -- convert MANY .ats files with shared parameters
+Choice [1/2]:
+```
+
+**Test mode** is for parameter-sensitivity studies. After the usual
+input/output folder prompts it lists the `.ats` files, you pick exactly
+one, and then type the emissivity values you want to try:
+
+```
+Emissivity values to test
+  range form:  [start, end, step]   e.g.  [0.3, 0.9, 0.1]
+  list form:   0.3 0.5 0.7   or   0.3,0.5,0.7
+Emissivities: [0.3, 0.9, 0.1]
+  -> 7 value(s): 0.300, 0.400, 0.500, 0.600, 0.700, 0.800, 0.900
+Proceed? [y/N/edit]:
+```
+
+The script then writes one full conversion (TIFF + JSON + PNG) per
+emissivity value, with the value embedded in the filename:
+
+```
+Rec-000548_eps0.300_temp_C.tif
+Rec-000548_eps0.300_meta.json
+Rec-000548_eps0.300_preview.png
+Rec-000548_eps0.400_temp_C.tif
+...
+```
+
+After the sweep finishes you're asked whether to run another sweep
+(pick another file and / or other emissivity values), hand off to
+batch mode, or quit.
+
+**Batch mode** is the original whole-folder converter that uses one
+shared set of parameters for every file. Batch mode never loops back —
+when it finishes the program exits.
 
 ### File-selection prompt (default)
 

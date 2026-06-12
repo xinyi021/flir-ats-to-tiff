@@ -54,6 +54,21 @@ Usage:
         (process only files 1 through 10 from the sorted .ats listing;
         also accepts e.g. "1 3 5", "1,3,5", or "1-5 10 15-20")
 
+    python flir_ats_batch.py --mode test
+        (skip the mode prompt and go straight to test mode -- a sweep of
+        emissivity values applied to a single .ats file the user picks;
+        each output is labelled with the emissivity it was made with)
+
+Modes:
+    On start the script asks whether you want TEST mode or BATCH mode.
+    Test mode is for parameter-sensitivity studies: pick one .ats, then
+    type the emissivity values to try (either a range '[start, end,
+    step]' or a discrete list '0.3 0.5 0.7') and the script writes one
+    full conversion per emissivity value, with the value embedded in the
+    output filename (e.g. Rec-000548_eps0.300_temp_C.tif).  After each
+    sweep you can run another, hand off to batch mode, or quit.  Batch
+    mode is the original whole-folder converter; it never loops back.
+
 File-selection prompt (default behaviour):
     After finding the .ats files under --input the script prints a
     numbered listing (1-based) and asks you to enter "all" / a range /
@@ -286,15 +301,19 @@ def apply_overrides(f, overrides: dict[str, float]) -> None:
 def convert_one(ats_path: Path, out_dir: Path,
                 *, unit: str = "celsius",
                 overrides: dict[str, float] | None = None,
-                overwrite: bool = False) -> dict:
-    """Convert one .ats into _temp_{C|K}.tif + _meta.json + _preview.png."""
+                overwrite: bool = False,
+                stem_suffix: str = "") -> dict:
+    """Convert one .ats into _temp_{C|K}.tif + _meta.json + _preview.png.
+
+    `stem_suffix` is appended to the output stem (used by test mode to
+    label files with the emissivity value they were generated with)."""
     if unit not in ("celsius", "kelvin"):
         raise ValueError(f"unit must be 'celsius' or 'kelvin', got {unit!r}")
     unit_suffix = "C" if unit == "celsius" else "K"
     unit_label  = "celsius" if unit == "celsius" else "kelvin"
 
     out_dir.mkdir(parents=True, exist_ok=True)
-    stem      = ats_path.stem
+    stem      = ats_path.stem + stem_suffix
     out_tif   = out_dir / f"{stem}_temp_{unit_suffix}.tif"
     out_json  = out_dir / f"{stem}_meta.json"
     out_png   = out_dir / f"{stem}_preview.png"
@@ -475,56 +494,207 @@ def prompt_file_selection(ats_files: list[Path],
         print("  cancelled, re-listing")
 
 
+def prompt_single_file(ats_files: list[Path], input_dir: Path) -> Path:
+    """List the files with 1-based indices and let the user pick exactly
+    one for the test-mode emissivity sweep."""
+    n = len(ats_files)
+    width = len(str(n))
+    while True:
+        print(f"\nFound {n} .ats files under {input_dir}:")
+        for i, p in enumerate(ats_files, 1):
+            sz_gb = p.stat().st_size / 1e9
+            print(f"  {i:>{width}}  {_display_name(p, input_dir):<40s}  "
+                  f"({sz_gb:5.2f} GB)")
+        raw = input("Pick ONE file by its number: ").strip()
+        try:
+            idx = int(raw)
+        except ValueError:
+            print("  not a number, try again")
+            continue
+        if not (1 <= idx <= n):
+            print(f"  out of range [1, {n}], try again")
+            continue
+        picked = ats_files[idx - 1]
+        print(f"  -> {_display_name(picked, input_dir)}")
+        return picked
+
+
+# ---------- Emissivity selection (test mode) ------------------------------
+def parse_emissivity_values(raw: str) -> list[float]:
+    """Parse either '[start, end, step]' (inclusive range) or a
+    space/comma-separated list of individual values.  Returns a list of
+    floats clamped to (0, 1] with duplicates kept, in user order."""
+    raw = raw.strip()
+    if not raw:
+        raise ValueError("empty input")
+
+    if raw.startswith("[") and raw.endswith("]"):
+        inner = raw[1:-1].replace(",", " ").split()
+        if len(inner) != 3:
+            raise ValueError(
+                f"range form needs exactly 3 numbers "
+                f"[start, end, step], got {len(inner)}"
+            )
+        start, end, step = (float(x) for x in inner)
+        if step <= 0:
+            raise ValueError("step must be > 0")
+        if end < start:
+            raise ValueError("end must be >= start")
+        vals: list[float] = []
+        x = start
+        # tiny tolerance so e.g. start=0.1, end=0.9, step=0.1 yields 0.9
+        while x <= end + step * 1e-6:
+            vals.append(round(x, 6))
+            x += step
+    else:
+        toks = raw.replace(",", " ").split()
+        try:
+            vals = [float(t) for t in toks]
+        except ValueError as exc:
+            raise ValueError(f"not all tokens are numbers: {exc}") from exc
+
+    for v in vals:
+        if not (0.0 < v <= 1.0):
+            raise ValueError(
+                f"emissivity must be in (0, 1], got {v}"
+            )
+    if not vals:
+        raise ValueError("no values parsed")
+    return vals
+
+
+def prompt_emissivity_values() -> list[float]:
+    """Get the list of emissivity values to test from the user.  Repeats
+    on parse error until accepted."""
+    print("\nEmissivity values to test")
+    print("  range form:  [start, end, step]   e.g.  [0.3, 0.9, 0.1]")
+    print("  list form:   0.3 0.5 0.7   or   0.3,0.5,0.7")
+    while True:
+        raw = input("Emissivities: ").strip()
+        try:
+            vals = parse_emissivity_values(raw)
+        except ValueError as exc:
+            print(f"  invalid input: {exc}, try again")
+            continue
+        print(f"  -> {len(vals)} value(s): "
+              f"{', '.join(f'{v:.3f}' for v in vals)}")
+        ans = input("Proceed? [y/N/edit]: ").strip().lower()
+        if ans in ("y", "yes"):
+            return vals
+        if ans in ("e", "edit"):
+            continue
+        print("  cancelled, re-entering")
+
+
+# ---------- Mode prompt and dispatcher helpers ----------------------------
+def prompt_mode() -> str:
+    """Return 'test' or 'batch'."""
+    print("\nWhat would you like to do?")
+    print("  [1] Test mode  -- sweep emissivity values on ONE .ats file")
+    print("  [2] Batch mode -- convert MANY .ats files with shared parameters")
+    while True:
+        ans = input("Choice [1/2]: ").strip().lower()
+        if ans in ("1", "t", "test"):
+            return "test"
+        if ans in ("2", "b", "batch"):
+            return "batch"
+        print("  please type 1, 2, t, or b")
+
+
+def prompt_post_test_action() -> str:
+    """After a test sweep finishes: 'test', 'batch', or 'exit'."""
+    print("\nWhat would you like to do next?")
+    print("  [t] another test sweep (pick a file + emissivity values)")
+    print("  [b] switch to batch mode and convert many files")
+    print("  [e] exit the program")
+    while True:
+        ans = input("Choice [t/b/e]: ").strip().lower()
+        if ans in ("t", "test", "1"):
+            return "test"
+        if ans in ("b", "batch", "2"):
+            return "batch"
+        if ans in ("e", "exit", "q", "quit", "3"):
+            return "exit"
+        print("  please type t, b, or e")
+
+
 # ---------- Batch driver --------------------------------------------------
 def _prompt_dir(prompt: str) -> Path | None:
     raw = input(prompt).strip().strip('"').strip("'")
     return Path(raw) if raw else None
 
 
-def main():
-    ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--input",  type=Path,
-                    help="Folder containing .ats files (prompts if omitted)")
-    ap.add_argument("--output", type=Path,
-                    help="Folder for .tif/.json/.png outputs (prompts if omitted)")
-    ap.add_argument("--unit", choices=("celsius", "kelvin"), default="celsius",
-                    help="Temperature unit written into the TIFF (default celsius)")
-    ap.add_argument("--no-recurse", action="store_true",
-                    help="Only scan the top level of --input; default is recursive")
-    ap.add_argument("--overwrite", action="store_true",
-                    help="Re-convert files whose outputs already exist")
-    ap.add_argument("--no-confirm", action="store_true",
-                    help="Skip the interactive object-parameter "
-                         "inspection/override prompt AND the file-selection "
-                         "prompt; use the values recorded inside each .ats "
-                         "verbatim and process every file found")
-    ap.add_argument("--files", type=str, default=None,
-                    help="Non-interactive file selection.  Same syntax as the "
-                         "interactive prompt: 'all', '1-10', '1 3 5', "
-                         "'1-5 10 15-20'.  1-based indices into the sorted "
-                         "list of .ats files under --input.")
-    args = ap.parse_args()
-
-    if args.input is None:
-        args.input = _prompt_dir("Input folder (contains .ats files): ")
-    if args.output is None:
-        args.output = _prompt_dir("Output folder for .tif + .json + .png: ")
-
-    if args.input is None or not args.input.is_dir():
-        print(f"ERROR: input folder not valid: {args.input}", file=sys.stderr)
+def _resolve_dirs(args) -> tuple[Path, Path]:
+    """CLI args or interactive prompts -> (input_dir, output_dir).  Exits
+    on missing or invalid input dir."""
+    inp = args.input or _prompt_dir("Input folder (contains .ats files): ")
+    out = args.output or _prompt_dir("Output folder for .tif + .json + .png: ")
+    if inp is None or not inp.is_dir():
+        print(f"ERROR: input folder not valid: {inp}", file=sys.stderr)
         sys.exit(1)
-    if args.output is None:
+    if out is None:
         print("ERROR: output folder is required", file=sys.stderr)
         sys.exit(1)
-    args.output.mkdir(parents=True, exist_ok=True)
+    out.mkdir(parents=True, exist_ok=True)
+    return inp, out
 
-    pattern = args.input.glob if args.no_recurse else args.input.rglob
-    all_ats_files = sorted(pattern("*.ats"))
-    if not all_ats_files:
-        print(f"No .ats files found under {args.input}")
-        sys.exit(0)
 
-    # ---- Pick a subset of files to process ------------------------------
+def _scan_ats(args, input_dir: Path) -> list[Path]:
+    pattern = input_dir.glob if args.no_recurse else input_dir.rglob
+    return sorted(pattern("*.ats"))
+
+
+# ---------- Test mode -----------------------------------------------------
+def test_mode(args, input_dir: Path, output_dir: Path,
+              all_ats_files: list[Path]) -> str:
+    """Iterative emissivity-sweep loop on a single .ats per round.
+    Returns 'batch' to continue into batch mode, or 'exit' to stop."""
+    print()
+    print("=== Test mode (emissivity sweep) ===")
+    print(f"  input dir:  {input_dir}")
+    print(f"  output dir: {output_dir}")
+    print(f"  unit:       {args.unit}")
+    print("  Other radiometric parameters stay at each file's recorded "
+          "values; only emissivity is varied per output file.")
+
+    while True:
+        ats = prompt_single_file(all_ats_files, input_dir)
+        eps_list = prompt_emissivity_values()
+
+        print(f"\n[test] {len(eps_list)} sweep step(s) on {ats.name}",
+              flush=True)
+        sweep_t0 = time.time()
+        for j, eps in enumerate(eps_list, 1):
+            suffix = f"_eps{eps:.3f}"
+            print(f"--- [{j}/{len(eps_list)}] emissivity = {eps:.3f} "
+                  f"(suffix={suffix}) ---", flush=True)
+            try:
+                r = convert_one(ats, output_dir,
+                                unit=args.unit,
+                                overrides={"emissivity": eps},
+                                overwrite=args.overwrite,
+                                stem_suffix=suffix)
+                print(f"  -> {r['status']}", flush=True)
+            except KeyboardInterrupt:
+                print("\n[interrupt] aborting current sweep")
+                break
+            except Exception as exc:
+                print(f"  !!! ERROR: {type(exc).__name__}: {exc}",
+                      flush=True)
+        print(f"\n[test] sweep finished in "
+              f"{(time.time()-sweep_t0)/60:.1f} min", flush=True)
+
+        action = prompt_post_test_action()
+        if action == "test":
+            continue
+        return action  # 'batch' or 'exit'
+
+
+# ---------- Batch mode ----------------------------------------------------
+def batch_mode(args, input_dir: Path, output_dir: Path,
+               all_ats_files: list[Path]) -> None:
+    """The original whole-folder conversion path."""
+    # ---- Pick a subset of files ----------------------------------------
     if args.files is not None:
         try:
             idxs = parse_file_selection(args.files, len(all_ats_files))
@@ -539,23 +709,20 @@ def main():
     elif args.no_confirm:
         ats_files = all_ats_files
     else:
-        ats_files = prompt_file_selection(all_ats_files, args.input)
+        ats_files = prompt_file_selection(all_ats_files, input_dir)
 
     print()
-    print(f"[setup] FLIR SDK loaded: {fnv.__file__}")
-    print(f"[setup] input:  {args.input}")
-    print(f"[setup] output: {args.output}")
-    print(f"[setup] {len(ats_files)} of {len(all_ats_files)} .ats files "
+    print(f"[batch] {len(ats_files)} of {len(all_ats_files)} .ats files "
           f"selected for conversion  "
           f"(unit={args.unit}, "
           f"{'overwrite' if args.overwrite else 'skip existing'})")
 
-    # ---- Inspect and optionally override radiometric parameters ---------
+    # ---- Inspect / override radiometric parameters ---------------------
     overrides: dict[str, float] = {}
     if args.no_confirm:
-        print("[setup] --no-confirm: using recorded object_parameters verbatim")
+        print("[batch] --no-confirm: using recorded object_parameters verbatim")
     else:
-        print(f"\n[setup] Inspecting recorded radiometric parameters from "
+        print(f"\n[batch] Inspecting recorded radiometric parameters from "
               f"the first file ({ats_files[0].name}) ...")
         try:
             probe = fnv.file.ImagerFile(str(ats_files[0]))
@@ -571,23 +738,23 @@ def main():
             overrides = {k: v for k, v in final.items()
                          if abs(v - initial[k]) > 1e-9}
             if overrides:
-                print(f"\n[setup] {len(overrides)} parameter(s) will be "
+                print(f"\n[batch] {len(overrides)} parameter(s) will be "
                       f"overridden on every file:")
                 for k, v in overrides.items():
                     print(f"          {k} = {v}  (was {initial[k]})")
             else:
-                print("\n[setup] no overrides -- using each file's recorded "
+                print("\n[batch] no overrides -- using each file's recorded "
                       "values verbatim")
 
     print()
     results = []
     batch_t0 = time.time()
     for i, ats in enumerate(ats_files, 1):
-        rel = (ats.relative_to(args.input)
-               if args.input in ats.parents else ats.name)
+        rel = (ats.relative_to(input_dir)
+               if input_dir in ats.parents else ats.name)
         print(f"=== [{i}/{len(ats_files)}] {rel} ===", flush=True)
         try:
-            r = convert_one(ats, args.output, unit=args.unit,
+            r = convert_one(ats, output_dir, unit=args.unit,
                             overrides=overrides if overrides else None,
                             overwrite=args.overwrite)
             r["path"] = str(ats)
@@ -608,6 +775,67 @@ def main():
     errors  = sum(1 for r in results if r["status"] == "error")
     print(f"[done] {len(results)} files in {elapsed_min:.1f} min  "
           f"(ok={ok}, skipped={skipped}, error={errors})")
+
+
+# ---------- main ----------------------------------------------------------
+def main():
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--input",  type=Path,
+                    help="Folder containing .ats files (prompts if omitted)")
+    ap.add_argument("--output", type=Path,
+                    help="Folder for .tif/.json/.png outputs (prompts if omitted)")
+    ap.add_argument("--unit", choices=("celsius", "kelvin"), default="celsius",
+                    help="Temperature unit written into the TIFF (default celsius)")
+    ap.add_argument("--mode", choices=("test", "batch"), default=None,
+                    help="Skip the interactive mode prompt and go straight "
+                         "to 'test' or 'batch'.")
+    ap.add_argument("--no-recurse", action="store_true",
+                    help="Only scan the top level of --input; default is recursive")
+    ap.add_argument("--overwrite", action="store_true",
+                    help="Re-convert files whose outputs already exist")
+    ap.add_argument("--no-confirm", action="store_true",
+                    help="Skip the interactive object-parameter "
+                         "inspection/override prompt AND the file-selection "
+                         "prompt; use the values recorded inside each .ats "
+                         "verbatim and process every file found")
+    ap.add_argument("--files", type=str, default=None,
+                    help="Non-interactive file selection.  Same syntax as the "
+                         "interactive prompt: 'all', '1-10', '1 3 5', "
+                         "'1-5 10 15-20'.  1-based indices into the sorted "
+                         "list of .ats files under --input.")
+    args = ap.parse_args()
+
+    print(f"[setup] FLIR SDK loaded: {fnv.__file__}")
+
+    # --- Mode dispatch ---------------------------------------------------
+    if args.mode is not None:
+        mode = args.mode
+    elif args.no_confirm or args.files is not None:
+        # Non-interactive shortcuts imply batch mode
+        mode = "batch"
+    else:
+        mode = prompt_mode()
+
+    # Folders + .ats listing (shared by both modes)
+    input_dir, output_dir = _resolve_dirs(args)
+    all_ats_files = _scan_ats(args, input_dir)
+    if not all_ats_files:
+        print(f"No .ats files found under {input_dir}")
+        sys.exit(0)
+
+    print(f"[setup] input:  {input_dir}")
+    print(f"[setup] output: {output_dir}")
+    print(f"[setup] found {len(all_ats_files)} .ats file(s)")
+
+    if mode == "test":
+        next_action = test_mode(args, input_dir, output_dir, all_ats_files)
+        if next_action == "batch":
+            batch_mode(args, input_dir, output_dir, all_ats_files)
+        # 'exit' falls through to end-of-program
+        return
+
+    # mode == "batch"
+    batch_mode(args, input_dir, output_dir, all_ats_files)
 
 
 if __name__ == "__main__":
