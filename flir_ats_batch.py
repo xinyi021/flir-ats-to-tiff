@@ -134,6 +134,18 @@ except ImportError as exc:
     )
     sys.exit(2)
 
+# Matplotlib is a soft dependency used to draw the post-sweep summary
+# PNGs (T-min / T-max curves vs the swept parameters).  If it isn't
+# installed the conversion still runs end-to-end -- we just skip the
+# plot and print a one-line note.
+try:
+    import matplotlib
+    matplotlib.use("Agg")    # headless backend; no DISPLAY required
+    import matplotlib.pyplot as plt
+    _HAVE_MATPLOTLIB = True
+except ImportError:
+    _HAVE_MATPLOTLIB = False
+
 
 # ---------- Tunable defaults -----------------------------------------------
 PREVIEW_PCT_LO          = 1       # percentile for 16-bit -> 8-bit preview
@@ -990,6 +1002,95 @@ def prompt_emissivity_values(
             return vals, raw
         if ans in ("e", "edit"):
             continue
+
+
+# ---------- Lambda-eff selection (test mode, exact-Planck path) ----------
+LAMBDA_EFF_BOUNDS_UM = (0.5, 15.0)
+DEFAULT_LAMBDA_EFF_SPEC = "[2.5, 4.5, 0.5]"
+
+
+def parse_lambda_eff_values(raw: str) -> list[float]:
+    """Like `parse_emissivity_values` but for the effective wavelength of
+    the camera+filter pass-band, in micrometres.  Bounds:
+    `LAMBDA_EFF_BOUNDS_UM` = (0.5, 15.0).  Accepts either
+    `[start, end, step]` or a space/comma-separated list."""
+    raw = raw.strip()
+    if not raw:
+        raise ValueError("empty input")
+    lo, hi = LAMBDA_EFF_BOUNDS_UM
+    if raw.startswith("[") and raw.endswith("]"):
+        inner = raw[1:-1].replace(",", " ").split()
+        if len(inner) != 3:
+            raise ValueError(
+                f"range form needs exactly 3 numbers "
+                f"[start, end, step], got {len(inner)}"
+            )
+        start, end, step = (float(x) for x in inner)
+        if step <= 0:
+            raise ValueError("step must be > 0")
+        if end < start:
+            raise ValueError("end must be >= start")
+        vals: list[float] = []
+        x = start
+        while x <= end + step * 1e-6:
+            vals.append(round(x, 6))
+            x += step
+    else:
+        toks = raw.replace(",", " ").split()
+        try:
+            vals = [float(t) for t in toks]
+        except ValueError as exc:
+            raise ValueError(f"not all tokens are numbers: {exc}") from exc
+
+    for v in vals:
+        if not (lo <= v <= hi):
+            raise ValueError(
+                f"lambda_eff must be in [{lo}, {hi}] um, got {v}"
+            )
+    if not vals:
+        raise ValueError("no values parsed")
+    return vals
+
+
+def prompt_lambda_eff_values(
+        default: str | None = None,
+) -> tuple[list[float], str]:
+    """Get the list of effective wavelengths to test (micrometres).  Same
+    UX as `prompt_emissivity_values`.  An empty line accepts `default`
+    (or `DEFAULT_LAMBDA_EFF_SPEC` if `default` is None).
+
+    Returns (vals, accepted_spec) for round-trip persistence.  When the
+    chosen correction method is `sdk_native`, lambda_eff has no effect
+    on the output -- callers should still collect it for completeness
+    but expect the SDK-native page builder to collapse the lambda list
+    to a single value with a console warning."""
+    effective_default = default or DEFAULT_LAMBDA_EFF_SPEC
+    lo, hi = LAMBDA_EFF_BOUNDS_UM
+    print("\nEffective wavelength (lambda_eff) values to test, in um")
+    print("  range form:  [start, end, step]   e.g.  [2.5, 4.5, 0.5]")
+    print("  list form:   2.5 3.0 3.5   or   2.5,3.0,3.5")
+    print(f"  bounds:      [{lo}, {hi}] um")
+    print(f"  default (just press Enter): {effective_default}"
+          + (f"  [remembered from last run]" if default else ""))
+    print("  Only used when the SDK refuses live eps edits and the tool "
+          "post-corrects in Python (exact-Planck path).  See README.")
+    while True:
+        raw = input("lambda_eff (um): ").strip()
+        if not raw:
+            raw = effective_default
+            print(f"  -> using default: {raw}")
+        try:
+            vals = parse_lambda_eff_values(raw)
+        except ValueError as exc:
+            print(f"  invalid input: {exc}, try again")
+            continue
+        print(f"  -> {len(vals)} value(s): "
+              f"{', '.join(f'{v:.3f}' for v in vals)}")
+        ans = input("Proceed? [y/N/edit]: ").strip().lower()
+        if ans in ("y", "yes"):
+            return vals, raw
+        if ans in ("e", "edit"):
+            continue
         print("  cancelled, re-entering")
 
 
@@ -1178,8 +1279,172 @@ def find_hottest_frame(ats_path: Path) -> tuple[int, float]:
     return best_idx, best_mean
 
 
+# ---------- Sweep summary plots -------------------------------------------
+def plot_sweep_results(page_stats: list[dict],
+                       lambda_eff_values: list[float],
+                       emissivities: list[float],
+                       out_dir: Path,
+                       stem: str,
+                       unit_label: str) -> list[Path]:
+    """Draw summary PNGs of per-page T_min / T_max against the swept
+    parameter(s) and save them next to the sweep TIFF.
+
+    Layout depends on how many values were swept on each axis:
+      - 1 lambda, n eps (or 1 eps, n lambda):  one line plot with two
+        curves (T_min, T_max) against the varied parameter.
+      - m lambda, n eps (both > 1):  four PNGs are written:
+          * stacked subplots, x = eps, one subplot per lambda
+          * stacked subplots, x = lambda, one subplot per eps
+          * 2-D heatmap of T_max with lambda on the y-axis and eps on
+            the x-axis (or vice versa, whichever fits the data better)
+          * 2-D heatmap of T_min, same axes
+      - 1 lambda, 1 eps: nothing drawn (one number says it all).
+
+    Returns the list of paths actually written.  Returns an empty list
+    silently if matplotlib is not installed.
+    """
+    if not _HAVE_MATPLOTLIB:
+        print(f"  [plot] matplotlib not installed -- skipping summary "
+              f"plots. `pip install matplotlib` to enable.", flush=True)
+        return []
+
+    n_lam = len(lambda_eff_values)
+    n_eps = len(emissivities)
+    if n_lam == 1 and n_eps == 1:
+        return []
+
+    # Build 2-D matrices indexed [i_lambda, j_eps].
+    T_min = np.full((n_lam, n_eps), np.nan, dtype=np.float64)
+    T_max = np.full((n_lam, n_eps), np.nan, dtype=np.float64)
+    for s in page_stats:
+        i = lambda_eff_values.index(s["lambda_eff_um"])
+        j = emissivities.index(s["emissivity"])
+        T_min[i, j] = s["min"]
+        T_max[i, j] = s["max"]
+
+    unit_sym = "C" if unit_label == "celsius" else "K"
+    written: list[Path] = []
+
+    def _save(fig, suffix: str) -> Path:
+        p = out_dir / f"{stem}_plot_{suffix}.png"
+        fig.tight_layout()
+        fig.savefig(p, dpi=120)
+        plt.close(fig)
+        written.append(p)
+        return p
+
+    # ---- One-dimensional case --------------------------------------
+    if n_lam == 1 or n_eps == 1:
+        if n_lam == 1:
+            xs = emissivities
+            x_label = "emissivity"
+            y_min = T_min[0]
+            y_max = T_max[0]
+            other = f"lambda_eff = {lambda_eff_values[0]:.3f} um"
+            suffix = "vs_eps"
+        else:
+            xs = lambda_eff_values
+            x_label = "lambda_eff (um)"
+            y_min = T_min[:, 0]
+            y_max = T_max[:, 0]
+            other = f"emissivity = {emissivities[0]:.3f}"
+            suffix = "vs_lambda"
+        fig, ax = plt.subplots(figsize=(8, 5))
+        ax.plot(xs, y_min, "o-", color="C0", label="T_min")
+        ax.plot(xs, y_max, "o-", color="C1", label="T_max")
+        ax.set_xlabel(x_label)
+        ax.set_ylabel(f"temperature (deg {unit_sym})")
+        ax.set_title(f"{stem}: hottest-frame T vs {x_label}  ({other})")
+        ax.grid(True, alpha=0.3)
+        ax.legend()
+        _save(fig, suffix)
+        return written
+
+    # ---- Two-dimensional case --------------------------------------
+    # Stacked-subplot 1: one subplot per lambda, x = eps.
+    fig, axes = plt.subplots(
+        n_lam, 1,
+        figsize=(8, max(3.5, min(28.0, 1.6 * n_lam + 1.5))),
+        sharex=True,
+    )
+    if n_lam == 1:
+        axes = [axes]
+    for i, lam in enumerate(lambda_eff_values):
+        ax = axes[i]
+        ax.plot(emissivities, T_min[i], "o-", color="C0", label="T_min")
+        ax.plot(emissivities, T_max[i], "o-", color="C1", label="T_max")
+        ax.set_ylabel(f"T (deg {unit_sym})")
+        ax.set_title(f"lambda_eff = {lam:.3f} um", fontsize=10)
+        ax.grid(True, alpha=0.3)
+        if i == 0:
+            ax.legend(loc="upper right")
+    axes[-1].set_xlabel("emissivity")
+    fig.suptitle(
+        f"{stem}: hottest-frame T vs emissivity, stacked by lambda_eff",
+        fontsize=12,
+    )
+    _save(fig, "by_eps_stacked")
+
+    # Stacked-subplot 2: one subplot per eps, x = lambda.
+    fig, axes = plt.subplots(
+        n_eps, 1,
+        figsize=(8, max(3.5, min(40.0, 1.4 * n_eps + 1.5))),
+        sharex=True,
+    )
+    if n_eps == 1:
+        axes = [axes]
+    for j, eps in enumerate(emissivities):
+        ax = axes[j]
+        ax.plot(lambda_eff_values, T_min[:, j], "o-", color="C0",
+                label="T_min")
+        ax.plot(lambda_eff_values, T_max[:, j], "o-", color="C1",
+                label="T_max")
+        ax.set_ylabel(f"T (deg {unit_sym})")
+        ax.set_title(f"eps = {eps:.3f}", fontsize=10)
+        ax.grid(True, alpha=0.3)
+        if j == 0:
+            ax.legend(loc="upper right")
+    axes[-1].set_xlabel("lambda_eff (um)")
+    fig.suptitle(
+        f"{stem}: hottest-frame T vs lambda_eff, stacked by emissivity",
+        fontsize=12,
+    )
+    _save(fig, "by_lambda_stacked")
+
+    # Heatmaps -- one per T_min and T_max.  x = eps, y = lambda.
+    eps_arr = np.asarray(emissivities, dtype=np.float64)
+    lam_arr = np.asarray(lambda_eff_values, dtype=np.float64)
+    # Build cell edges from the value midpoints so each value sits at
+    # the centre of its cell.
+    def _edges(v: np.ndarray) -> np.ndarray:
+        if len(v) == 1:
+            return np.array([v[0] - 0.5, v[0] + 0.5])
+        mids = 0.5 * (v[:-1] + v[1:])
+        return np.concatenate(
+            ([v[0] - (mids[0] - v[0])], mids, [v[-1] + (v[-1] - mids[-1])])
+        )
+    x_edges = _edges(eps_arr)
+    y_edges = _edges(lam_arr)
+    for matrix, kind, cmap in (
+        (T_max, "T_max", "inferno"),
+        (T_min, "T_min", "viridis"),
+    ):
+        fig, ax = plt.subplots(figsize=(8, max(3.5, 0.4 * n_lam + 3)))
+        pcm = ax.pcolormesh(x_edges, y_edges, matrix,
+                            cmap=cmap, shading="flat")
+        ax.set_xlabel("emissivity")
+        ax.set_ylabel("lambda_eff (um)")
+        ax.set_title(f"{stem}: {kind} (deg {unit_sym}) across the sweep")
+        ax.invert_yaxis()  # smaller lambda at the top reads more naturally
+        fig.colorbar(pcm, ax=ax, label=f"{kind} (deg {unit_sym})")
+        _save(fig, f"heatmap_{kind.lower()}")
+
+    return written
+
+
 def test_sweep_one_file(ats_path: Path, out_dir: Path,
                         emissivities: list[float], *,
+                        lambda_eff_values: list[float] | None = None,
                         unit: str = "celsius",
                         overwrite: bool = False,
                         crop: tuple[int, int, int, int] | None = None,
@@ -1188,32 +1453,45 @@ def test_sweep_one_file(ats_path: Path, out_dir: Path,
     """For ONE .ats file:
       1.  Find the hottest frame (mean ADC count) -- one pass over the
           stack -- unless `hottest_idx` was supplied by an earlier scan.
-      2.  Open the file at Unit.TEMPERATURE_FACTORY and read the
-          recorded emissivity.
-      3.  For each test emissivity, compute that page's temperature
-          map using the best method this file allows:
-            - if `can_change_object_parameters` is True the SDK accepts
-              live emissivity edits, so we set
+      2.  Open the file at Unit.TEMPERATURE_FACTORY, read the recorded
+          emissivity, and runtime-probe whether the SDK actually honours
+          live `object_parameters.emissivity` edits (the advertised
+          flag is unreliable on X6900sc files -- see README).
+      3.  Build the full set of (lambda_eff, emissivity) combinations
+          (`product(lambda_eff_values, emissivities)` -- outer loop is
+          lambda, inner loop is eps) and for each combination compute
+          that page's temperature map using the best available method:
+            - sdk_native (probe Δ > 0.5 K): set
               `f.object_parameters.emissivity = eps`, re-read the
               hottest frame, and let the SDK perform its full band-
-              integrated radiometric inversion (gold standard);
-            - otherwise we read the hottest frame once at the recorded
-              emissivity and post-correct it with the closed-form
-              exact single-wavelength Planck inversion at
-              `DEFAULT_LAMBDA_EFF_UM`.
-          Either way we then apply the user-chosen crop and flip, and
-          prepend a dark label strip with "emissivity = X.XXX" in
-          white at the TOP of the page (so the burnt-in label never
-          occludes pixels).
+              integrated radiometric inversion (gold standard).
+              `lambda_eff` is not a parameter of this path; if the
+              caller supplied a multi-value `lambda_eff_values` list,
+              it is collapsed to a single value with a console warning.
+            - exact_planck_single_wavelength: read the hottest frame
+              once at the recorded eps and post-correct it for each
+              (lambda_eff, eps) combination with the closed-form Planck
+              inversion.
+          The user-chosen crop and flip are applied to every page, and
+          a dark label strip with "lambda=X.XX um  eps=Y.YYY" is
+          prepended at the TOP (never occludes pixels).
       4.  Stack the resulting pages into a single multi-page float32
+          TIFF.  Page index j corresponds to
+          (lambda_eff_values[j // n_eps], emissivities[j % n_eps]).
+      5.  When matplotlib is installed and the sweep covers more than
+          one combination, draw summary plots of per-page T_min/T_max
+          against the swept parameter(s) and write them next to the
           TIFF.
 
     Output (next to each other):
-        <stem>_eps_sweep_temp_{C|K}.tif      one page per emissivity
+        <stem>_eps_sweep_temp_{C|K}.tif      one page per (lambda, eps)
         <stem>_eps_sweep_meta.json           hottest frame + per-page stats
                                              + which correction method
                                              was used
+        <stem>_sweep_plot*.png               summary plot(s) of T vs param
     """
+    if lambda_eff_values is None:
+        lambda_eff_values = [DEFAULT_LAMBDA_EFF_UM]
     out_dir.mkdir(parents=True, exist_ok=True)
     stem = ats_path.stem
     suff = "C" if unit == "celsius" else "K"
@@ -1296,45 +1574,70 @@ def test_sweep_one_file(ats_path: Path, out_dir: Path,
                   f"this file -- using exact-Planck post-correction at "
                   f"lambda_eff = {DEFAULT_LAMBDA_EFF_UM} um", flush=True)
 
+    # SDK-native path doesn't take lambda_eff -- collapse any multi-
+    # value request to a single sentinel so the loop and the post-sweep
+    # plotting don't generate identical pages.
+    if correction_method == "sdk_native" and len(lambda_eff_values) > 1:
+        print(f"  [info] SDK-native path is active -- lambda_eff is not a "
+              f"parameter of the camera's own radiometric inversion, so "
+              f"the {len(lambda_eff_values)} requested values would "
+              f"produce identical pages.  Collapsing lambda_eff_values "
+              f"to [{lambda_eff_values[0]:.3f}] for the sweep.",
+              flush=True)
+        lambda_eff_values = [lambda_eff_values[0]]
+
+    n_lam = len(lambda_eff_values)
+    n_eps = len(emissivities)
+    n_pages = n_lam * n_eps
+
     pages, page_stats = [], []
     unit_sym = "deg C" if unit == "celsius" else "K"
-    print(f"  building {len(emissivities)} emissivity page(s) "
-          f"(crop={crop}, flip={flip_mode}, "
+    print(f"  building {n_pages} page(s) "
+          f"(n_lambda={n_lam} x n_eps={n_eps}, "
+          f"crop={crop}, flip={flip_mode}, "
           f"method={correction_method}) ...", flush=True)
-    for j, eps in enumerate(emissivities, 1):
-        if abs(eps - eps_recorded) < 1e-9:
-            T_new_K = T_recorded_K
-        elif correction_method == "sdk_native":
-            # Ask the SDK to recompute under the new emissivity using
-            # its own factory band-integrated inversion.
-            f.object_parameters.emissivity = float(eps)
-            f.get_frame(best_idx)
-            T_new_K = (np.asarray(f.final, dtype=np.float32)
-                       .reshape((H, W)))
-        else:
-            T_new_K = emissivity_correct_kelvin(
-                T_recorded_K, eps_recorded, float(eps),
-                lambda_eff_um=DEFAULT_LAMBDA_EFF_UM,
-            )
-        page = (T_new_K
-                - (KELVIN_OFFSET if unit == "celsius" else 0.0)
-                ).astype(np.float32)
-        # Crop first, then flip: same order the batch path uses, so the
-        # frame the user sees in Fiji matches what batch-mode TIFFs will
-        # look like for the same camera and the same chosen settings.
-        page = apply_flip(apply_crop(page, crop), flip_mode)
-        pages.append(page)
-        page_stats.append({
-            "page_index": j - 1,
-            "emissivity": float(eps),
-            "min": float(page.min()),
-            "max": float(page.max()),
-            "mean": float(page.mean()),
-        })
-        print(f"    [{j}/{len(emissivities)}] eps={eps:.3f}  "
-              f"min/mean/max = "
-              f"{page.min():.1f} / {page.mean():.1f} / {page.max():.1f} "
-              f"{unit_sym}", flush=True)
+    j = 0
+    for lam in lambda_eff_values:
+        for eps in emissivities:
+            j += 1
+            if abs(eps - eps_recorded) < 1e-9:
+                # Emissivity unchanged -- lambda_eff is mathematically
+                # irrelevant (the closed-form Planck formula collapses
+                # to T_new = T_assumed regardless of lambda).
+                T_new_K = T_recorded_K
+            elif correction_method == "sdk_native":
+                # Ask the SDK to recompute under the new emissivity
+                # using its own factory band-integrated inversion.
+                f.object_parameters.emissivity = float(eps)
+                f.get_frame(best_idx)
+                T_new_K = (np.asarray(f.final, dtype=np.float32)
+                           .reshape((H, W)))
+            else:
+                T_new_K = emissivity_correct_kelvin(
+                    T_recorded_K, eps_recorded, float(eps),
+                    lambda_eff_um=float(lam),
+                )
+            page = (T_new_K
+                    - (KELVIN_OFFSET if unit == "celsius" else 0.0)
+                    ).astype(np.float32)
+            # Crop first, then flip: same order the batch path uses, so
+            # the frame the user sees in Fiji matches what batch-mode
+            # TIFFs will look like for the same camera and the same
+            # chosen settings.
+            page = apply_flip(apply_crop(page, crop), flip_mode)
+            pages.append(page)
+            page_stats.append({
+                "page_index": j - 1,
+                "lambda_eff_um": float(lam),
+                "emissivity": float(eps),
+                "min": float(page.min()),
+                "max": float(page.max()),
+                "mean": float(page.mean()),
+            })
+            print(f"    [{j}/{n_pages}] lambda={lam:.3f} um "
+                  f"eps={eps:.3f}  min/mean/max = "
+                  f"{page.min():.1f} / {page.mean():.1f} / "
+                  f"{page.max():.1f} {unit_sym}", flush=True)
 
     # Pick values that make the label strip a clear dark bar with bright
     # white text under whatever auto-contrast Fiji applies to the stack.
@@ -1350,8 +1653,13 @@ def test_sweep_one_file(ats_path: Path, out_dir: Path,
           f"({len(pages)} pages, {strip_h + out_H}x{out_W} float32, "
           f"label on top) ...", flush=True)
     with tifffile.TiffWriter(str(out_tif), bigtiff=False) as tw:
-        for page, eps in zip(pages, emissivities):
-            label = f"emissivity = {eps:.3f}"
+        for page, stat in zip(pages, page_stats):
+            lam = stat["lambda_eff_um"]
+            eps = stat["emissivity"]
+            if n_lam > 1:
+                label = f"lambda={lam:.2f} um  eps={eps:.3f}"
+            else:
+                label = f"emissivity = {eps:.3f}"
             strip = render_label_strip(label, out_W, strip_h,
                                        bg_val, fg_val)
             # Label strip goes ABOVE the picture so the burnt-in text
@@ -1370,6 +1678,11 @@ def test_sweep_one_file(ats_path: Path, out_dir: Path,
         "hottest_frame_index": int(best_idx),
         "hottest_frame_mean_adc_count": float(best_mean_count),
         "test_emissivity_values": [float(e) for e in emissivities],
+        "test_lambda_eff_um_values": [float(l) for l in lambda_eff_values],
+        "page_order": (
+            "outer = lambda_eff_um, inner = emissivity; "
+            "page_index = i_lambda * n_eps + i_eps"
+        ),
         "pixel_unit_written": "celsius" if unit == "celsius" else "kelvin",
         "data_type_in_tiff": "float32",
         "source_height": int(H),
@@ -1386,14 +1699,15 @@ def test_sweep_one_file(ats_path: Path, out_dir: Path,
         "tiff_layout": (
             f"Each page is the hottest frame (index {best_idx}) of the "
             "source .ats, decoded in Unit.TEMPERATURE_FACTORY at the "
-            f"emissivity in test_emissivity_values[page] (recorded eps "
+            "(lambda_eff_um, emissivity) combination recorded in "
+            f"per_page_summary[page] (recorded eps "
             f"= {eps_recorded:.4f}; correction method = "
             f"{correction_method!r}), cropped to {crop} and flipped "
             f"({flip_mode}). All other object_parameters were left at "
             f"their recorded values.  A {strip_h}-row label strip is "
-            "PREPENDED at the top of every page (white text 'emissivity "
-            "= X.XXX' on a dark background); the real scene area is the "
-            f"bottom {out_H} rows."
+            "PREPENDED at the top of every page (white text on a dark "
+            f"background); the real scene area is the bottom {out_H} "
+            "rows."
         ),
         "emissivity_correction": (
             {
@@ -1421,7 +1735,7 @@ def test_sweep_one_file(ats_path: Path, out_dir: Path,
                     "* (exp(C2/(lambda_eff*T_assumed)) - 1)))"
                 ),
                 "C2_um_K": PLANCK_C2_UM_K,
-                "lambda_eff_um": DEFAULT_LAMBDA_EFF_UM,
+                "lambda_eff_um_values": [float(l) for l in lambda_eff_values],
                 "eps_assumed_at_decode_time": float(eps_recorded),
                 "reflection_term": (
                     "omitted (valid when scene T >> reflected_T)"),
@@ -1448,10 +1762,23 @@ def test_sweep_one_file(ats_path: Path, out_dir: Path,
     }
     out_json.write_text(json.dumps(meta, indent=2, default=str))
 
+    # ---- Summary plots ----------------------------------------------------
+    plot_paths = plot_sweep_results(
+        page_stats=page_stats,
+        lambda_eff_values=list(lambda_eff_values),
+        emissivities=list(emissivities),
+        out_dir=out_dir,
+        stem=f"{stem}_eps_sweep",
+        unit_label=("celsius" if unit == "celsius" else "kelvin"),
+    )
+    for p in plot_paths:
+        print(f"  [plot] wrote {p.name}", flush=True)
+
     return {
         "status": "ok",
         "tif_mb": out_tif.stat().st_size / 1e6,
         "n_pages": len(pages),
+        "n_plots": len(plot_paths),
         "hottest_frame": int(best_idx),
         "elapsed_s": time.time() - t0,
     }
@@ -1559,6 +1886,11 @@ def test_mode(args, input_dir: Path, output_dir: Path,
         state["emissivity_spec"] = eps_spec
         save_state(state)
 
+        lambda_list, lambda_spec = prompt_lambda_eff_values(
+            default=state.get("lambda_eff_spec"))
+        state["lambda_eff_spec"] = lambda_spec
+        save_state(state)
+
         # One scan to find the hottest frame -- its data drives the crop
         # preview AND is fed straight into the sweep, so we never scan
         # the same file twice in a single round.
@@ -1584,13 +1916,16 @@ def test_mode(args, input_dir: Path, output_dir: Path,
         save_state(state)
 
         print(f"\n[test] sweep on {ats.name} with "
-              f"{len(eps_list)} emissivity value(s), "
+              f"{len(eps_list)} emissivity value(s) x "
+              f"{len(lambda_list)} lambda_eff value(s) = "
+              f"{len(eps_list) * len(lambda_list)} page(s), "
               f"crop={crop}, flip={flip_mode}", flush=True)
         try:
             # Test mode always overwrites: users iterate parameter choices
             # and expect the latest values to land on disk, not a stale
             # output from an earlier round to be silently kept.
             r = test_sweep_one_file(ats, output_dir, eps_list,
+                                    lambda_eff_values=lambda_list,
                                     unit=args.unit,
                                     overwrite=True,
                                     crop=crop,
@@ -1777,7 +2112,7 @@ def main():
     if state:
         print(f"[state] remembered defaults from {STATE_FILE}")
         for k in ("mode", "input_dir", "output_dir", "file_selection",
-                  "test_file_name", "emissivity_spec",
+                  "test_file_name", "emissivity_spec", "lambda_eff_spec",
                   "crop_spec", "flip_mode"):
             if k in state:
                 print(f"          {k:<16} = {state[k]}")

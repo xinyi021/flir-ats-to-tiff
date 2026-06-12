@@ -91,8 +91,12 @@ the physics and the per-step error budget.
 3. Install the rest of the Python dependencies:
 
    ```powershell
-   pip install numpy tifffile pillow
+   pip install numpy tifffile pillow matplotlib
    ```
+
+   `matplotlib` is a soft dependency: only used to draw the post-sweep
+   summary PNGs in test mode.  The conversion itself works without it
+   (the script just prints a one-line note and skips the plots).
 
 4. Verify the SDK loads:
 
@@ -167,17 +171,41 @@ Test mode is deliberately frugal:
    file is never scanned twice.
 2. That single frame is decoded once in `Unit.TEMPERATURE_FACTORY`
    using the emissivity baked into the recording.
-3. For every emissivity value you asked for, a Wien high-T
-   post-correction is applied in Python (see "About the Wien
-   correction" below), the result is cropped + flipped according to
-   the values you confirmed, and a 28-row label strip is **prepended
-   at the top** of the page (white text `emissivity = X.XXX` on a dark
-   band).  The label sits above the picture so it never occludes any
-   pixel of the real scene.  Each emissivity becomes one page of a
-   single multi-page float32 TIFF.  In Fiji you scroll-wheel through
-   the stack, the label tells you which page you're looking at, and
-   `Image → Adjust → Brightness/Contrast → Auto` makes the strip a
-   tidy black bar at the top of the image.
+3. **Test mode now sweeps two parameters at once**: emissivity (`ε`)
+   AND the effective wavelength (`λ_eff`) used by the exact-Planck
+   post-correction.  Each prompt accepts the same `[start, end, step]`
+   or list syntax.  With `n_ε` emissivities and `n_λ` lambdas, the
+   sweep produces `n_λ × n_ε` pages — outer loop is `λ`, inner loop is
+   `ε`, so scrolling the TIFF in Fiji walks all `ε` at the first `λ`,
+   then jumps to the next `λ`, etc.
+4. Each page is exact-Planck-post-corrected at its `(λ_eff, ε)` pair
+   (or SDK-native-decoded when the SDK actually honours live ε edits,
+   in which case `λ_eff` collapses to a single value with a console
+   note), cropped + flipped according to your settings, and a 28-row
+   label strip is **prepended at the top** of the page (white text
+   `lambda=X.XX um  eps=Y.YYY` on a dark band — or just
+   `emissivity = X.XXX` when only `ε` was swept).  The label sits
+   above the picture so it never occludes any pixel of the real
+   scene.
+5. After the sweep finishes the script writes **summary PNGs** next to
+   the TIFF (requires `matplotlib`; install with `pip install
+   matplotlib`):
+     - 1-D sweep (only `ε` *or* only `λ` varied):
+       `*_eps_sweep_plot_vs_{eps,lambda}.png` — single line chart with
+       `T_min` and `T_max` curves vs the varied parameter.
+     - 2-D sweep (both varied):
+       * `*_eps_sweep_plot_by_eps_stacked.png` — vertically stacked
+         subplots, one per `λ`, x = `ε`, two curves per subplot
+         (`T_min`, `T_max`).
+       * `*_eps_sweep_plot_by_lambda_stacked.png` — same idea,
+         transposed: one subplot per `ε`, x = `λ`.
+       * `*_eps_sweep_plot_heatmap_t_max.png` and
+         `*_eps_sweep_plot_heatmap_t_min.png` — 2-D pcolormesh of
+         `T_max` and `T_min` with `λ` on the y-axis and `ε` on the
+         x-axis.  The heatmap is the fastest way to see where the
+         "interesting" region of the parameter space lives.
+   If matplotlib is missing the rest of the sweep still runs; only
+   the plot step is skipped.
 
 #### About the emissivity correction
 
@@ -306,6 +334,7 @@ press-Enter default at each prompt:
           file_selection   = 1-5 10
           test_file_name   = Rec-000548.ats
           emissivity_spec  = [0.1, 0.95, 0.05]
+          lambda_eff_spec  = [2.5, 4.5, 0.5]
           crop_spec        = 100-540 50-460
           flip_mode        = rot180
           object_overrides = {'emissivity': 0.85}
