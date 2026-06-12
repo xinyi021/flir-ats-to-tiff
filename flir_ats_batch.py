@@ -142,6 +142,28 @@ FALLBACK_PREVIEW_FRAME  = 700
 ZLIB_LEVEL              = 5       # tiff compression level (1=fast, 9=best)
 KELVIN_OFFSET           = 273.15
 
+# Persisted user-state file: every interactive prompt remembers the value
+# the user entered last time and offers it as the press-Enter default.
+STATE_FILE = Path.home() / ".flir_ats_batch_state.json"
+
+
+def load_state() -> dict:
+    """Read the saved last-run state from disk; empty dict on any error."""
+    if not STATE_FILE.is_file():
+        return {}
+    try:
+        return json.loads(STATE_FILE.read_text())
+    except Exception:
+        return {}
+
+
+def save_state(state: dict) -> None:
+    """Best-effort write; failures are not fatal."""
+    try:
+        STATE_FILE.write_text(json.dumps(state, indent=2, default=str))
+    except Exception:
+        pass
+
 
 # ---------- JSON helpers ---------------------------------------------------
 def _jsonable(x):
@@ -248,24 +270,40 @@ def print_object_params(params: dict[str, float], heading: str) -> None:
         print(f"  {name:<28s}  {v:>12.4f}  {unit:<12s} {desc}")
 
 
-def prompt_object_param_overrides(initial: dict[str, float]) -> dict[str, float]:
+def prompt_object_param_overrides(initial: dict[str, float],
+                                  last_overrides: dict[str, float] | None = None
+                                  ) -> dict[str, float]:
     """Display the recorded parameters and let the user override any of
     them.  Returns the final dict (initial + overrides).  Loops until the
-    user confirms."""
+    user confirms.
+
+    `last_overrides` (saved from a previous run) is shown as the
+    suggested default at each per-parameter prompt.  Empty input keeps
+    that suggestion (which falls back to the recorded value if the user
+    did not override that parameter previously)."""
+    last_overrides = dict(last_overrides or {})
     while True:
         print_object_params(initial, "Radiometric inversion parameters "
                             "(recorded inside the first .ats):")
-        print("\n  These were applied during the recording.  Press Enter at "
-              "each prompt to keep the recorded value, or type a new number.")
+        if last_overrides:
+            print(f"\n  Last run overrode: " +
+                  ", ".join(f"{k}={v}" for k, v in last_overrides.items()))
+        print("\n  Press Enter at each prompt to keep the suggested value, "
+              "or type a new number.")
         modify = input("\n  Do you want to override any of them? [y/N]: "
                        ).strip().lower()
         if modify not in ("y", "yes"):
-            return dict(initial)
+            # Re-apply last_overrides if the user just presses through.
+            out = dict(initial)
+            out.update(last_overrides)
+            return out
 
         new_vals = dict(initial)
+        new_vals.update(last_overrides)
         for name, unit, desc in OBJECT_PARAM_FIELDS:
             cur = new_vals[name]
-            raw = input(f"    {name} [{cur:.4f} {unit}]: ").strip()
+            note = " (last)" if name in last_overrides else ""
+            raw = input(f"    {name} [{cur:.4f} {unit}{note}]: ").strip()
             if not raw:
                 continue
             try:
@@ -477,6 +515,26 @@ def parse_file_selection(raw: str, n_total: int) -> list[int]:
     return sorted(selected)
 
 
+def _compress_indices(idxs: list[int]) -> str:
+    """Collapse a sorted 1-based index list into the most compact spec
+    string the inverse of `parse_file_selection` would accept, e.g.
+    [1,2,3,5,7,8,9] -> '1-3 5 7-9'.  Used when persisting the user's
+    last batch-mode file selection."""
+    if not idxs:
+        return ""
+    parts: list[str] = []
+    run_lo = run_hi = idxs[0]
+    for i in idxs[1:]:
+        if i == run_hi + 1:
+            run_hi = i
+            continue
+        parts.append(str(run_lo) if run_lo == run_hi
+                     else f"{run_lo}-{run_hi}")
+        run_lo = run_hi = i
+    parts.append(str(run_lo) if run_lo == run_hi else f"{run_lo}-{run_hi}")
+    return " ".join(parts)
+
+
 def _display_name(p: Path, input_dir: Path) -> str:
     try:
         return str(p.relative_to(input_dir))
@@ -485,9 +543,12 @@ def _display_name(p: Path, input_dir: Path) -> str:
 
 
 def prompt_file_selection(ats_files: list[Path],
-                          input_dir: Path) -> list[Path]:
+                          input_dir: Path,
+                          default_selection: str | None = None) -> list[Path]:
     """List the .ats files with 1-based indices and let the user pick a
-    subset.  Re-prompts on invalid input or rejected confirmation."""
+    subset.  Re-prompts on invalid input or rejected confirmation.
+    Empty input accepts `default_selection` if given (typically the
+    string the user typed last time, like '1-10')."""
     n = len(ats_files)
     width = len(str(n))
     while True:
@@ -501,7 +562,11 @@ def prompt_file_selection(ats_files: list[Path],
         print("  '1-10'                 -> a range (inclusive)")
         print("  '1 3 5' or '1,3,5'     -> individual files")
         print("  '1-5 10 15-20'         -> mix of ranges and individuals")
-        raw = input("Selection: ").strip()
+        tag = f"  [Enter = last: {default_selection}]" if default_selection else ""
+        raw = input(f"Selection{tag}: ").strip()
+        if not raw and default_selection:
+            raw = default_selection
+            print(f"  -> using last: {raw}")
         try:
             idxs = parse_file_selection(raw, n)
         except ValueError as exc:
@@ -523,18 +588,32 @@ def prompt_file_selection(ats_files: list[Path],
         print("  cancelled, re-listing")
 
 
-def prompt_single_file(ats_files: list[Path], input_dir: Path) -> Path:
+def prompt_single_file(ats_files: list[Path], input_dir: Path,
+                       default_name: str | None = None) -> Path:
     """List the files with 1-based indices and let the user pick exactly
-    one for the test-mode emissivity sweep."""
+    one for the test-mode emissivity sweep.  `default_name` is the
+    relative filename the user picked last time; if it still appears in
+    the listing, Enter picks it again."""
     n = len(ats_files)
     width = len(str(n))
+    default_idx = None
+    if default_name:
+        for i, p in enumerate(ats_files, 1):
+            if _display_name(p, input_dir) == default_name:
+                default_idx = i
+                break
     while True:
         print(f"\nFound {n} .ats files under {input_dir}:")
         for i, p in enumerate(ats_files, 1):
             sz_gb = p.stat().st_size / 1e9
+            mark = " <- last" if i == default_idx else ""
             print(f"  {i:>{width}}  {_display_name(p, input_dir):<40s}  "
-                  f"({sz_gb:5.2f} GB)")
-        raw = input("Pick ONE file by its number: ").strip()
+                  f"({sz_gb:5.2f} GB){mark}")
+        tag = (f"  [Enter = last: {default_idx} ({default_name})]"
+               if default_idx else "")
+        raw = input(f"Pick ONE file by its number{tag}: ").strip()
+        if not raw and default_idx:
+            raw = str(default_idx)
         try:
             idx = int(raw)
         except ValueError:
@@ -595,18 +674,26 @@ def parse_emissivity_values(raw: str) -> list[float]:
 DEFAULT_EMISSIVITY_SPEC = "[0.1, 0.95, 0.05]"
 
 
-def prompt_emissivity_values() -> list[float]:
+def prompt_emissivity_values(
+        default: str | None = None,
+) -> tuple[list[float], str]:
     """Get the list of emissivity values to test from the user.  Repeats
-    on parse error until accepted.  An empty line is accepted as the
-    default sweep spec (`DEFAULT_EMISSIVITY_SPEC`)."""
+    on parse error until accepted.  An empty line accepts `default`
+    (or `DEFAULT_EMISSIVITY_SPEC` if `default` is None).
+
+    Returns (vals, accepted_spec) where `accepted_spec` is the exact
+    string the user typed (or the default they accepted), suitable for
+    re-offering verbatim next time."""
+    effective_default = default or DEFAULT_EMISSIVITY_SPEC
     print("\nEmissivity values to test")
     print("  range form:  [start, end, step]   e.g.  [0.3, 0.9, 0.1]")
     print("  list form:   0.3 0.5 0.7   or   0.3,0.5,0.7")
-    print(f"  default (just press Enter): {DEFAULT_EMISSIVITY_SPEC}")
+    print(f"  default (just press Enter): {effective_default}"
+          + (f"  [remembered from last run]" if default else ""))
     while True:
         raw = input("Emissivities: ").strip()
         if not raw:
-            raw = DEFAULT_EMISSIVITY_SPEC
+            raw = effective_default
             print(f"  -> using default: {raw}")
         try:
             vals = parse_emissivity_values(raw)
@@ -617,7 +704,7 @@ def prompt_emissivity_values() -> list[float]:
               f"{', '.join(f'{v:.3f}' for v in vals)}")
         ans = input("Proceed? [y/N/edit]: ").strip().lower()
         if ans in ("y", "yes"):
-            return vals
+            return vals, raw
         if ans in ("e", "edit"):
             continue
         print("  cancelled, re-entering")
@@ -881,13 +968,16 @@ def test_sweep_one_file(ats_path: Path, out_dir: Path,
 
 
 # ---------- Mode prompt and dispatcher helpers ----------------------------
-def prompt_mode() -> str:
-    """Return 'test' or 'batch'."""
+def prompt_mode(default: str | None = None) -> str:
+    """Return 'test' or 'batch'.  Empty input accepts `default` if given."""
     print("\nWhat would you like to do?")
     print("  [1] Test mode  -- sweep emissivity values on ONE .ats file")
     print("  [2] Batch mode -- convert MANY .ats files with shared parameters")
+    tag = f"  [Enter = last: {default}]" if default in ("test", "batch") else ""
     while True:
-        ans = input("Choice [1/2]: ").strip().lower()
+        ans = input(f"Choice [1/2]{tag}: ").strip().lower()
+        if not ans and default in ("test", "batch"):
+            return default
         if ans in ("1", "t", "test"):
             return "test"
         if ans in ("2", "b", "batch"):
@@ -913,16 +1003,27 @@ def prompt_post_test_action() -> str:
 
 
 # ---------- Batch driver --------------------------------------------------
-def _prompt_dir(prompt: str) -> Path | None:
+def _prompt_dir(prompt: str, default: Path | None = None) -> Path | None:
+    if default is not None:
+        prompt = f"{prompt}\n  [Enter = last: {default}]: "
+    else:
+        prompt = f"{prompt}: "
     raw = input(prompt).strip().strip('"').strip("'")
-    return Path(raw) if raw else None
+    if not raw:
+        return default
+    return Path(raw)
 
 
-def _resolve_dirs(args) -> tuple[Path, Path]:
+def _resolve_dirs(args, state: dict) -> tuple[Path, Path]:
     """CLI args or interactive prompts -> (input_dir, output_dir).  Exits
-    on missing or invalid input dir."""
-    inp = args.input or _prompt_dir("Input folder (contains .ats files): ")
-    out = args.output or _prompt_dir("Output folder for .tif + .json + .png: ")
+    on missing or invalid input dir.  Reads `state['input_dir']` /
+    `state['output_dir']` as the Enter-default for each prompt."""
+    last_in = Path(state["input_dir"]) if state.get("input_dir") else None
+    last_out = Path(state["output_dir"]) if state.get("output_dir") else None
+    inp = args.input or _prompt_dir(
+        "Input folder (contains .ats files)", default=last_in)
+    out = args.output or _prompt_dir(
+        "Output folder for .tif + .json + .png", default=last_out)
     if inp is None or not inp.is_dir():
         print(f"ERROR: input folder not valid: {inp}", file=sys.stderr)
         sys.exit(1)
@@ -940,7 +1041,7 @@ def _scan_ats(args, input_dir: Path) -> list[Path]:
 
 # ---------- Test mode -----------------------------------------------------
 def test_mode(args, input_dir: Path, output_dir: Path,
-              all_ats_files: list[Path]) -> str:
+              all_ats_files: list[Path], state: dict) -> str:
     """Iterative emissivity-sweep loop.  Each round picks ONE .ats file
     and a list of emissivity values, finds the hottest frame in that
     file, and writes a single multi-page TIFF where each page is the
@@ -958,8 +1059,15 @@ def test_mode(args, input_dir: Path, output_dir: Path,
     print("  parameters stay at each file's recorded values.")
 
     while True:
-        ats = prompt_single_file(all_ats_files, input_dir)
-        eps_list = prompt_emissivity_values()
+        ats = prompt_single_file(all_ats_files, input_dir,
+                                 default_name=state.get("test_file_name"))
+        state["test_file_name"] = _display_name(ats, input_dir)
+        save_state(state)
+
+        eps_list, eps_spec = prompt_emissivity_values(
+            default=state.get("emissivity_spec"))
+        state["emissivity_spec"] = eps_spec
+        save_state(state)
 
         print(f"\n[test] sweep on {ats.name} with "
               f"{len(eps_list)} emissivity value(s)", flush=True)
@@ -989,7 +1097,7 @@ def test_mode(args, input_dir: Path, output_dir: Path,
 
 # ---------- Batch mode ----------------------------------------------------
 def batch_mode(args, input_dir: Path, output_dir: Path,
-               all_ats_files: list[Path]) -> None:
+               all_ats_files: list[Path], state: dict) -> None:
     """The original whole-folder conversion path."""
     # ---- Pick a subset of files ----------------------------------------
     if args.files is not None:
@@ -1003,10 +1111,22 @@ def batch_mode(args, input_dir: Path, output_dir: Path,
                   file=sys.stderr)
             sys.exit(1)
         ats_files = [all_ats_files[i - 1] for i in idxs]
+        state["file_selection"] = args.files
+        save_state(state)
     elif args.no_confirm:
         ats_files = all_ats_files
     else:
-        ats_files = prompt_file_selection(all_ats_files, input_dir)
+        ats_files = prompt_file_selection(
+            all_ats_files, input_dir,
+            default_selection=state.get("file_selection"))
+        # The interactive prompt re-parses the user's raw string for us,
+        # but we don't get the raw back -- reconstruct a faithful spec by
+        # collapsing the picked indices, so press-Enter next round.
+        picked_idx = sorted(all_ats_files.index(p) + 1 for p in ats_files)
+        state["file_selection"] = (
+            "all" if picked_idx == list(range(1, len(all_ats_files) + 1))
+            else _compress_indices(picked_idx))
+        save_state(state)
 
     print()
     print(f"[batch] {len(ats_files)} of {len(all_ats_files)} .ats files "
@@ -1031,9 +1151,12 @@ def batch_mode(args, input_dir: Path, output_dir: Path,
             initial = None
 
         if initial is not None:
-            final = prompt_object_param_overrides(initial)
+            final = prompt_object_param_overrides(
+                initial, last_overrides=state.get("object_overrides"))
             overrides = {k: v for k, v in final.items()
                          if abs(v - initial[k]) > 1e-9}
+            state["object_overrides"] = overrides
+            save_state(state)
             if overrides:
                 print(f"\n[batch] {len(overrides)} parameter(s) will be "
                       f"overridden on every file:")
@@ -1104,6 +1227,20 @@ def main():
 
     print(f"[setup] FLIR SDK loaded: {fnv.__file__}")
 
+    # --- Session state (Enter-default for every interactive prompt) -----
+    state = load_state()
+    if state:
+        print(f"[state] remembered defaults from {STATE_FILE}")
+        for k in ("mode", "input_dir", "output_dir", "file_selection",
+                  "test_file_name", "emissivity_spec"):
+            if k in state:
+                print(f"          {k:<16} = {state[k]}")
+        if state.get("object_overrides"):
+            print(f"          object_overrides = "
+                  f"{dict(state['object_overrides'])}")
+    else:
+        print(f"[state] no previous defaults found ({STATE_FILE})")
+
     # --- Mode dispatch ---------------------------------------------------
     if args.mode is not None:
         mode = args.mode
@@ -1111,10 +1248,16 @@ def main():
         # Non-interactive shortcuts imply batch mode
         mode = "batch"
     else:
-        mode = prompt_mode()
+        mode = prompt_mode(default=state.get("mode"))
+    state["mode"] = mode
+    save_state(state)
 
     # Folders + .ats listing (shared by both modes)
-    input_dir, output_dir = _resolve_dirs(args)
+    input_dir, output_dir = _resolve_dirs(args, state)
+    state["input_dir"]  = str(input_dir)
+    state["output_dir"] = str(output_dir)
+    save_state(state)
+
     all_ats_files = _scan_ats(args, input_dir)
     if not all_ats_files:
         print(f"No .ats files found under {input_dir}")
@@ -1125,14 +1268,15 @@ def main():
     print(f"[setup] found {len(all_ats_files)} .ats file(s)")
 
     if mode == "test":
-        next_action = test_mode(args, input_dir, output_dir, all_ats_files)
+        next_action = test_mode(args, input_dir, output_dir,
+                                all_ats_files, state)
         if next_action == "batch":
-            batch_mode(args, input_dir, output_dir, all_ats_files)
+            batch_mode(args, input_dir, output_dir, all_ats_files, state)
         # 'exit' falls through to end-of-program
         return
 
     # mode == "batch"
-    batch_mode(args, input_dir, output_dir, all_ats_files)
+    batch_mode(args, input_dir, output_dir, all_ats_files, state)
 
 
 if __name__ == "__main__":

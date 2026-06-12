@@ -194,6 +194,30 @@ batch mode, or quit.
 shared set of parameters for every file. Batch mode never loops back —
 when it finishes the program exits.
 
+### Remembered defaults (press Enter to re-use last run)
+
+Every interactive choice you make is written to
+`~/.flir_ats_batch_state.json` (on Windows that is
+`C:\Users\<you>\.flir_ats_batch_state.json`). On the next launch the
+script prints the remembered values and offers them as the
+press-Enter default at each prompt:
+
+```
+[state] remembered defaults from C:\Users\me\.flir_ats_batch_state.json
+          mode             = test
+          input_dir        = D:\Recordings\modulated
+          output_dir       = E:\converted\modulated
+          file_selection   = 1-5 10
+          test_file_name   = Rec-000548.ats
+          emissivity_spec  = [0.1, 0.95, 0.05]
+          object_overrides = {'emissivity': 0.85}
+```
+
+Anything stored is fully overridable: just type a new value at the
+prompt instead of pressing Enter, and the new value replaces the old
+default in the JSON. There is no separate "reset" command — delete
+`~/.flir_ats_batch_state.json` if you want to start fresh.
+
 ### File-selection prompt (default)
 
 After finding the `.ats` files under `--input` the script lists them
