@@ -956,9 +956,12 @@ def test_mode(args, input_dir: Path, output_dir: Path,
         print(f"\n[test] sweep on {ats.name} with "
               f"{len(eps_list)} emissivity value(s)", flush=True)
         try:
+            # Test mode always overwrites: users iterate parameter choices
+            # and expect the latest values to land on disk, not a stale
+            # output from an earlier round to be silently kept.
             r = test_sweep_one_file(ats, output_dir, eps_list,
                                     unit=args.unit,
-                                    overwrite=args.overwrite)
+                                    overwrite=True)
             print(f"  -> {r['status']}  "
                   f"({r.get('n_pages', 0)} pages, "
                   f"{r.get('tif_mb', 0):.2f} MB, "
